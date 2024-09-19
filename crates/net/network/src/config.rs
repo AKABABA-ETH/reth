@@ -1,27 +1,25 @@
 //! Network config support
 
-use crate::{
-    error::NetworkError,
-    import::{BlockImport, ProofOfStakeBlockImport},
-    peers::PeersConfig,
-    session::SessionsConfig,
-    transactions::TransactionsManagerConfig,
-    NetworkHandle, NetworkManager,
-};
-use reth_chainspec::{
-    net::{mainnet_nodes, sepolia_nodes, TrustedPeer},
-    ChainSpec, MAINNET,
-};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+
+use reth_chainspec::{ChainSpec, MAINNET};
 use reth_discv4::{Discv4Config, Discv4ConfigBuilder, NatResolver, DEFAULT_DISCOVERY_ADDRESS};
 use reth_discv5::NetworkStackId;
 use reth_dns_discovery::DnsDiscoveryConfig;
 use reth_eth_wire::{HelloMessage, HelloMessageWithProtocols, Status};
-use reth_network_peers::{pk2id, PeerId};
+use reth_network_peers::{mainnet_nodes, pk2id, sepolia_nodes, PeerId, TrustedPeer};
+use reth_network_types::{PeersConfig, SessionsConfig};
 use reth_primitives::{ForkFilter, Head};
-use reth_provider::{BlockReader, HeaderProvider};
+use reth_storage_api::{BlockNumReader, BlockReader, HeaderProvider};
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use secp256k1::SECP256K1;
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
+
+use crate::{
+    error::NetworkError,
+    import::{BlockImport, ProofOfStakeBlockImport},
+    transactions::TransactionsManagerConfig,
+    NetworkHandle, NetworkManager,
+};
 
 // re-export for convenience
 use crate::protocol::{IntoRlpxSubProtocol, RlpxSubProtocols};
@@ -92,6 +90,11 @@ impl NetworkConfig<()> {
     pub fn builder(secret_key: SecretKey) -> NetworkConfigBuilder {
         NetworkConfigBuilder::new(secret_key)
     }
+
+    /// Convenience method for creating the corresponding builder type with a random secret key.
+    pub fn builder_with_rng_secret_key() -> NetworkConfigBuilder {
+        NetworkConfigBuilder::with_rng_secret_key()
+    }
 }
 
 impl<C> NetworkConfig<C> {
@@ -120,16 +123,27 @@ impl<C> NetworkConfig<C> {
 
 impl<C> NetworkConfig<C>
 where
+    C: BlockNumReader + 'static,
+{
+    /// Convenience method for calling [`NetworkManager::new`].
+    pub async fn manager(self) -> Result<NetworkManager, NetworkError> {
+        NetworkManager::new(self).await
+    }
+}
+
+impl<C> NetworkConfig<C>
+where
     C: BlockReader + HeaderProvider + Clone + Unpin + 'static,
 {
     /// Starts the networking stack given a [`NetworkConfig`] and returns a handle to the network.
     pub async fn start_network(self) -> Result<NetworkHandle, NetworkError> {
         let client = self.client.clone();
-        let (handle, network, _txpool, eth) =
-            NetworkManager::builder(self).await?.request_handler(client).split_with_handle();
+        let (handle, network, _txpool, eth) = NetworkManager::builder::<C>(self)
+            .await?
+            .request_handler::<C>(client)
+            .split_with_handle();
 
         tokio::task::spawn(network);
-        // TODO: tokio::task::spawn(txpool);
         tokio::task::spawn(eth);
         Ok(handle)
     }
@@ -180,6 +194,12 @@ pub struct NetworkConfigBuilder {
 
 #[allow(missing_docs)]
 impl NetworkConfigBuilder {
+    /// Create a new builder instance with a random secret key.
+    pub fn with_rng_secret_key() -> Self {
+        Self::new(rng_secret_key())
+    }
+
+    /// Create a new builder instance with the given secret key.
     pub fn new(secret_key: SecretKey) -> Self {
         Self {
             secret_key,
@@ -214,6 +234,11 @@ impl NetworkConfigBuilder {
     /// Returns the configured [`PeerId`]
     pub fn get_peer_id(&self) -> PeerId {
         pk2id(&self.secret_key.public_key(SECP256K1))
+    }
+
+    /// Returns the configured [`SecretKey`], from which the node's identity is derived.
+    pub const fn secret_key(&self) -> &SecretKey {
+        &self.secret_key
     }
 
     /// Sets the chain spec.
@@ -361,10 +386,15 @@ impl NetworkConfigBuilder {
         self.boot_nodes(sepolia_nodes())
     }
 
-    /// Sets the boot nodes.
+    /// Sets the boot nodes to use to bootstrap the configured discovery services (discv4 + discv5).
     pub fn boot_nodes<T: Into<TrustedPeer>>(mut self, nodes: impl IntoIterator<Item = T>) -> Self {
         self.boot_nodes = nodes.into_iter().map(Into::into).collect();
         self
+    }
+
+    /// Returns an iterator over all configured boot nodes.
+    pub fn boot_nodes_iter(&self) -> impl Iterator<Item = &TrustedPeer> + '_ {
+        self.boot_nodes.iter()
     }
 
     /// Disable the DNS discovery.
@@ -411,36 +441,6 @@ impl NetworkConfigBuilder {
         }
     }
 
-    /// Calls a closure on [`reth_discv5::ConfigBuilder`], if discv5 discovery is enabled and the
-    /// builder has been set.
-    /// ```
-    /// use reth_chainspec::MAINNET;
-    /// use reth_network::NetworkConfigBuilder;
-    /// use reth_provider::test_utils::NoopProvider;
-    /// use secp256k1::{rand::thread_rng, SecretKey};
-    ///
-    /// let sk = SecretKey::new(&mut thread_rng());
-    /// let fork_id = MAINNET.latest_fork_id();
-    /// let network_config = NetworkConfigBuilder::new(sk)
-    ///     .map_discv5_config_builder(|builder| builder.fork(b"eth", fork_id))
-    ///     .build(NoopProvider::default());
-    /// ```
-    pub fn map_discv5_config_builder(
-        mut self,
-        f: impl FnOnce(reth_discv5::ConfigBuilder) -> reth_discv5::ConfigBuilder,
-    ) -> Self {
-        if let Some(mut builder) = self.discovery_v5_builder {
-            if let Some(network_stack_id) = NetworkStackId::id(&self.chain_spec) {
-                let fork_id = self.chain_spec.latest_fork_id();
-                builder = builder.fork(network_stack_id, fork_id);
-            }
-
-            self.discovery_v5_builder = Some(f(builder));
-        }
-
-        self
-    }
-
     /// Adds a new additional protocol to the `RLPx` sub-protocol list.
     pub fn add_rlpx_sub_protocol(mut self, protocol: impl IntoRlpxSubProtocol) -> Self {
         self.extra_protocols.push(protocol);
@@ -461,11 +461,10 @@ impl NetworkConfigBuilder {
 
     /// Convenience function for creating a [`NetworkConfig`] with a noop provider that does
     /// nothing.
-    #[cfg(any(test, feature = "test-utils"))]
     pub fn build_with_noop_provider(
         self,
-    ) -> NetworkConfig<reth_provider::test_utils::NoopProvider> {
-        self.build(reth_provider::test_utils::NoopProvider::default())
+    ) -> NetworkConfig<reth_storage_api::noop::NoopBlockReader> {
+        self.build(Default::default())
     }
 
     /// Consumes the type and creates the actual [`NetworkConfig`]
@@ -480,7 +479,7 @@ impl NetworkConfigBuilder {
             secret_key,
             mut dns_discovery_config,
             discovery_v4_builder,
-            discovery_v5_builder,
+            mut discovery_v5_builder,
             boot_nodes,
             discovery_addr,
             listener_addr,
@@ -497,13 +496,22 @@ impl NetworkConfigBuilder {
             transactions_manager_config,
         } = self;
 
+        discovery_v5_builder = discovery_v5_builder.map(|mut builder| {
+            if let Some(network_stack_id) = NetworkStackId::id(&chain_spec) {
+                let fork_id = chain_spec.latest_fork_id();
+                builder = builder.fork(network_stack_id, fork_id)
+            }
+
+            builder
+        });
+
         let listener_addr = listener_addr.unwrap_or(DEFAULT_DISCOVERY_ADDRESS);
 
         let mut hello_message =
             hello_message.unwrap_or_else(|| HelloMessage::builder(peer_id).build());
         hello_message.port = listener_addr.port();
 
-        let head = head.unwrap_or(Head {
+        let head = head.unwrap_or_else(|| Head {
             hash: chain_spec.genesis_hash(),
             number: 0,
             timestamp: chain_spec.genesis.timestamp,
@@ -585,7 +593,6 @@ mod tests {
     use reth_dns_discovery::tree::LinkEntry;
     use reth_primitives::ForkHash;
     use reth_provider::test_utils::NoopProvider;
-    use std::collections::BTreeMap;
 
     fn builder() -> NetworkConfigBuilder {
         let secret_key = SecretKey::new(&mut thread_rng());
@@ -609,7 +616,7 @@ mod tests {
         let mut chain_spec = Arc::clone(&MAINNET);
 
         // remove any `next` fields we would have by removing all hardforks
-        Arc::make_mut(&mut chain_spec).hardforks = BTreeMap::new();
+        Arc::make_mut(&mut chain_spec).hardforks = Default::default();
 
         // check that the forkid is initialized with the genesis and no other forks
         let genesis_fork_hash = ForkHash::from(chain_spec.genesis_hash());

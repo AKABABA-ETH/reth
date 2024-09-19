@@ -17,6 +17,9 @@
 /// The container indicates when the trie has been modified.
 pub mod prefix_set;
 
+/// The implementation of forward-only in-memory cursor.
+pub mod forward_cursor;
+
 /// The cursor implementations for navigating account and storage tries.
 pub mod trie_cursor;
 
@@ -33,8 +36,15 @@ pub mod node_iter;
 mod state;
 pub use state::*;
 
+/// Input for trie computation.
+mod input;
+pub use input::TrieInput;
+
 /// Merkle proof generation.
 pub mod proof;
+
+/// Trie witness generation.
+pub mod witness;
 
 /// The implementation of the Merkle Patricia Trie.
 mod trie;

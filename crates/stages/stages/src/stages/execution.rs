@@ -3,15 +3,17 @@ use num_traits::Zero;
 use reth_config::config::ExecutionConfig;
 use reth_db::{static_file::HeaderMask, tables};
 use reth_db_api::{cursor::DbCursorRO, database::Database, transaction::DbTx};
-use reth_evm::execute::{BatchExecutor, BlockExecutorProvider};
+use reth_evm::{
+    execute::{BatchExecutor, BlockExecutorProvider},
+    metrics::ExecutorMetrics,
+};
 use reth_execution_types::{Chain, ExecutionOutcome};
 use reth_exex::{ExExManagerHandle, ExExNotification};
-use reth_primitives::{
-    constants::gas_units::{GIGAGAS, KILOGAS, MEGAGAS},
-    BlockNumber, Header, StaticFileSegment,
-};
+use reth_primitives::{BlockNumber, Header, StaticFileSegment};
+use reth_primitives_traits::format_gas_throughput;
 use reth_provider::{
     providers::{StaticFileProvider, StaticFileProviderRWRefMut, StaticFileWriter},
+    writer::UnifiedStorageWriter,
     BlockReader, DatabaseProviderRW, HeaderProvider, LatestStateProviderRef, OriginalValuesKnown,
     ProviderError, StateWriter, StatsReader, TransactionVariant,
 };
@@ -19,8 +21,8 @@ use reth_prune_types::PruneModes;
 use reth_revm::database::StateProviderDatabase;
 use reth_stages_api::{
     BlockErrorKind, CheckpointBlockRange, EntitiesCheckpoint, ExecInput, ExecOutput,
-    ExecutionCheckpoint, MetricEvent, MetricEventsSender, Stage, StageCheckpoint, StageError,
-    StageId, UnwindInput, UnwindOutput,
+    ExecutionCheckpoint, ExecutionStageThresholds, Stage, StageCheckpoint, StageError, StageId,
+    UnwindInput, UnwindOutput,
 };
 use std::{
     cmp::Ordering,
@@ -62,7 +64,6 @@ use tracing::*;
 // false positive, we cannot derive it if !DB: Debug.
 #[allow(missing_debug_implementations)]
 pub struct ExecutionStage<E> {
-    metrics_tx: Option<MetricEventsSender>,
     /// The stage's internal block executor
     executor_provider: E,
     /// The commit thresholds of the execution stage.
@@ -84,11 +85,13 @@ pub struct ExecutionStage<E> {
     post_unwind_commit_input: Option<Chain>,
     /// Handle to communicate with `ExEx` manager.
     exex_manager_handle: ExExManagerHandle,
+    /// Executor metrics.
+    metrics: ExecutorMetrics,
 }
 
 impl<E> ExecutionStage<E> {
     /// Create new execution stage with specified config.
-    pub const fn new(
+    pub fn new(
         executor_provider: E,
         thresholds: ExecutionStageThresholds,
         external_clean_threshold: u64,
@@ -96,7 +99,6 @@ impl<E> ExecutionStage<E> {
         exex_manager_handle: ExExManagerHandle,
     ) -> Self {
         Self {
-            metrics_tx: None,
             external_clean_threshold,
             executor_provider,
             thresholds,
@@ -104,12 +106,13 @@ impl<E> ExecutionStage<E> {
             post_execute_commit_input: None,
             post_unwind_commit_input: None,
             exex_manager_handle,
+            metrics: ExecutorMetrics::default(),
         }
     }
 
     /// Create an execution stage with the provided executor.
     ///
-    /// The commit threshold will be set to `10_000`.
+    /// The commit threshold will be set to [`MERKLE_STAGE_DEFAULT_CLEAN_THRESHOLD`].
     pub fn new_with_executor(executor_provider: E) -> Self {
         Self::new(
             executor_provider,
@@ -134,12 +137,6 @@ impl<E> ExecutionStage<E> {
             prune_modes,
             ExExManagerHandle::empty(),
         )
-    }
-
-    /// Set the metric events sender.
-    pub fn with_metrics_tx(mut self, metrics_tx: MetricEventsSender) -> Self {
-        self.metrics_tx = Some(metrics_tx);
-        self
     }
 
     /// Adjusts the prune modes related to changesets.
@@ -211,6 +208,7 @@ where
         let static_file_producer = if self.prune_modes.receipts.is_none() &&
             self.prune_modes.receipts_log_filter.is_empty()
         {
+            debug!(target: "sync::stages::execution", start = start_block, "Preparing static file producer");
             let mut producer = prepare_static_file_producer(provider, start_block)?;
             // Since there might be a database <-> static file inconsistency (read
             // `prepare_static_file_producer` for context), we commit the change straight away.
@@ -224,8 +222,9 @@ where
             provider.tx_ref(),
             provider.static_file_provider().clone(),
         ));
-        let mut executor = self.executor_provider.batch_executor(db, prune_modes);
+        let mut executor = self.executor_provider.batch_executor(db);
         executor.set_tip(max_block);
+        executor.set_prune_modes(prune_modes);
 
         // Progress tracking
         let mut stage_progress = start_block;
@@ -234,6 +233,13 @@ where
 
         let mut fetch_block_duration = Duration::default();
         let mut execution_duration = Duration::default();
+
+        let mut last_block = start_block;
+        let mut last_execution_duration = Duration::default();
+        let mut last_cumulative_gas = 0;
+        let mut last_log_instant = Instant::now();
+        let log_duration = Duration::from_secs(10);
+
         debug!(target: "sync::stages::execution", start = start_block, end = max_block, "Executing range");
 
         // Execute block range
@@ -264,18 +270,29 @@ where
             // Execute the block
             let execute_start = Instant::now();
 
-            executor.execute_and_verify_one((&block, td).into()).map_err(|error| {
-                StageError::Block {
+            self.metrics.metered((&block, td).into(), |input| {
+                executor.execute_and_verify_one(input).map_err(|error| StageError::Block {
                     block: Box::new(block.header.clone().seal_slow()),
                     error: BlockErrorKind::Execution(error),
-                }
+                })
             })?;
+
             execution_duration += execute_start.elapsed();
 
-            // Gas metrics
-            if let Some(metrics_tx) = &mut self.metrics_tx {
-                let _ =
-                    metrics_tx.send(MetricEvent::ExecutionStageGas { gas: block.header.gas_used });
+            // Log execution throughput
+            if last_log_instant.elapsed() >= log_duration {
+                info!(
+                    target: "sync::stages::execution",
+                    start = last_block,
+                    end = block_number,
+                    throughput = format_gas_throughput(cumulative_gas - last_cumulative_gas, execution_duration - last_execution_duration),
+                    "Executed block range"
+                );
+
+                last_block = block_number + 1;
+                last_execution_duration = execution_duration;
+                last_cumulative_gas = cumulative_gas;
+                last_log_instant = Instant::now();
             }
 
             stage_progress = block_number;
@@ -335,12 +352,11 @@ where
         }
 
         let time = Instant::now();
+
         // write output
-        state.write_to_storage(
-            provider.tx_ref(),
-            static_file_producer,
-            OriginalValuesKnown::Yes,
-        )?;
+        let mut writer = UnifiedStorageWriter::new(&provider, static_file_producer);
+        writer.write_to_storage(state, OriginalValuesKnown::Yes)?;
+
         let db_write_duration = time.elapsed();
         debug!(
             target: "sync::stages::execution",
@@ -388,7 +404,7 @@ where
         // Unwind account and storage changesets, as well as receipts.
         //
         // This also updates `PlainStorageState` and `PlainAccountState`.
-        let bundle_state_with_receipts = provider.unwind_or_peek_state::<true>(range.clone())?;
+        let bundle_state_with_receipts = provider.take_state(range.clone())?;
 
         // Prepare the input for post unwind commit hook, where an `ExExNotification` will be sent.
         if self.exex_manager_handle.has_exexs() {
@@ -422,7 +438,7 @@ where
             // files do not support filters.
             //
             // If we hit this case, the receipts have already been unwound by the call to
-            // `unwind_or_peek_state`.
+            // `take_state`.
         }
 
         // Update the checkpoint.
@@ -527,6 +543,8 @@ fn calculate_gas_used_from_headers(
     provider: &StaticFileProvider,
     range: RangeInclusive<BlockNumber>,
 ) -> Result<u64, ProviderError> {
+    debug!(target: "sync::stages::execution", ?range, "Calculating gas used from headers");
+
     let mut gas_total = 0;
 
     let start = Instant::now();
@@ -541,86 +559,9 @@ fn calculate_gas_used_from_headers(
     }
 
     let duration = start.elapsed();
-    trace!(target: "sync::stages::execution", ?range, ?duration, "Time elapsed in calculate_gas_used_from_headers");
+    debug!(target: "sync::stages::execution", ?range, ?duration, "Finished calculating gas used from headers");
 
     Ok(gas_total)
-}
-
-/// The thresholds at which the execution stage writes state changes to the database.
-///
-/// If either of the thresholds (`max_blocks` and `max_changes`) are hit, then the execution stage
-/// commits all pending changes to the database.
-///
-/// A third threshold, `max_changesets`, can be set to periodically write changesets to the
-/// current database transaction, which frees up memory.
-#[derive(Debug, Clone)]
-pub struct ExecutionStageThresholds {
-    /// The maximum number of blocks to execute before the execution stage commits.
-    pub max_blocks: Option<u64>,
-    /// The maximum number of state changes to keep in memory before the execution stage commits.
-    pub max_changes: Option<u64>,
-    /// The maximum cumulative amount of gas to process before the execution stage commits.
-    pub max_cumulative_gas: Option<u64>,
-    /// The maximum spent on blocks processing before the execution stage commits.
-    pub max_duration: Option<Duration>,
-}
-
-impl Default for ExecutionStageThresholds {
-    fn default() -> Self {
-        Self {
-            max_blocks: Some(500_000),
-            max_changes: Some(5_000_000),
-            // 50k full blocks of 30M gas
-            max_cumulative_gas: Some(30_000_000 * 50_000),
-            // 10 minutes
-            max_duration: Some(Duration::from_secs(10 * 60)),
-        }
-    }
-}
-
-impl ExecutionStageThresholds {
-    /// Check if the batch thresholds have been hit.
-    #[inline]
-    pub fn is_end_of_batch(
-        &self,
-        blocks_processed: u64,
-        changes_processed: u64,
-        cumulative_gas_used: u64,
-        elapsed: Duration,
-    ) -> bool {
-        blocks_processed >= self.max_blocks.unwrap_or(u64::MAX) ||
-            changes_processed >= self.max_changes.unwrap_or(u64::MAX) ||
-            cumulative_gas_used >= self.max_cumulative_gas.unwrap_or(u64::MAX) ||
-            elapsed >= self.max_duration.unwrap_or(Duration::MAX)
-    }
-}
-
-impl From<ExecutionConfig> for ExecutionStageThresholds {
-    fn from(config: ExecutionConfig) -> Self {
-        Self {
-            max_blocks: config.max_blocks,
-            max_changes: config.max_changes,
-            max_cumulative_gas: config.max_cumulative_gas,
-            max_duration: config.max_duration,
-        }
-    }
-}
-
-/// Returns a formatted gas throughput log, showing either:
-///  * "Kgas/s", or 1,000 gas per second
-///  * "Mgas/s", or 1,000,000 gas per second
-///  * "Ggas/s", or 1,000,000,000 gas per second
-///
-/// Depending on the magnitude of the gas throughput.
-pub fn format_gas_throughput(gas: u64, execution_duration: Duration) -> String {
-    let gas_per_second = gas as f64 / execution_duration.as_secs_f64();
-    if gas_per_second < MEGAGAS as f64 {
-        format!("{:.} Kgas/second", gas_per_second / KILOGAS as f64)
-    } else if gas_per_second < GIGAGAS as f64 {
-        format!("{:.} Mgas/second", gas_per_second / MEGAGAS as f64)
-    } else {
-        format!("{:.} Ggas/second", gas_per_second / GIGAGAS as f64)
-    }
 }
 
 /// Returns a `StaticFileProviderRWRefMut` static file producer after performing a consistency
@@ -742,22 +683,6 @@ mod tests {
     }
 
     #[test]
-    fn test_gas_throughput_fmt() {
-        let duration = Duration::from_secs(1);
-        let gas = 100_000;
-        let throughput = format_gas_throughput(gas, duration);
-        assert_eq!(throughput, "100 Kgas/second");
-
-        let gas = 100_000_000;
-        let throughput = format_gas_throughput(gas, duration);
-        assert_eq!(throughput, "100 Mgas/second");
-
-        let gas = 100_000_000_000;
-        let throughput = format_gas_throughput(gas, duration);
-        assert_eq!(throughput, "100 Ggas/second");
-    }
-
-    #[test]
     fn execution_checkpoint_matches() {
         let factory = create_test_provider_factory();
 
@@ -795,12 +720,9 @@ mod tests {
                     .try_seal_with_senders()
                     .map_err(|_| BlockValidationError::SenderRecoveryError)
                     .unwrap(),
-                None,
             )
             .unwrap();
-        provider
-            .insert_historical_block(block.clone().try_seal_with_senders().unwrap(), None)
-            .unwrap();
+        provider.insert_historical_block(block.clone().try_seal_with_senders().unwrap()).unwrap();
         provider
             .static_file_provider()
             .latest_writer(StaticFileSegment::Headers)
@@ -840,10 +762,8 @@ mod tests {
         let genesis = SealedBlock::decode(&mut genesis_rlp).unwrap();
         let mut block_rlp = hex!("f90262f901f9a075c371ba45999d87f4542326910a11af515897aebce5265d3f6acd1f1161f82fa01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa098f2dcd87c8ae4083e7017a05456c14eea4b1db2032126e27b3b1563d57d7cc0a08151d548273f6683169524b66ca9fe338b9ce42bc3540046c828fd939ae23bcba03f4e5c2ec5b2170b711d97ee755c160457bb58d8daa338e835ec02ae6860bbabb901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083020000018502540be40082a8798203e800a00000000000000000000000000000000000000000000000000000000000000000880000000000000000f863f861800a8405f5e10094100000000000000000000000000000000000000080801ba07e09e26678ed4fac08a249ebe8ed680bf9051a5e14ad223e4b2b9d26e0208f37a05f6e3f188e3e6eab7d7d3b6568f5eac7d687b08d307d3154ccd8c87b4630509bc0").as_slice();
         let block = SealedBlock::decode(&mut block_rlp).unwrap();
-        provider.insert_historical_block(genesis.try_seal_with_senders().unwrap(), None).unwrap();
-        provider
-            .insert_historical_block(block.clone().try_seal_with_senders().unwrap(), None)
-            .unwrap();
+        provider.insert_historical_block(genesis.try_seal_with_senders().unwrap()).unwrap();
+        provider.insert_historical_block(block.clone().try_seal_with_senders().unwrap()).unwrap();
         provider
             .static_file_provider()
             .latest_writer(StaticFileSegment::Headers)
@@ -883,10 +803,8 @@ mod tests {
         let genesis = SealedBlock::decode(&mut genesis_rlp).unwrap();
         let mut block_rlp = hex!("f90262f901f9a075c371ba45999d87f4542326910a11af515897aebce5265d3f6acd1f1161f82fa01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa098f2dcd87c8ae4083e7017a05456c14eea4b1db2032126e27b3b1563d57d7cc0a08151d548273f6683169524b66ca9fe338b9ce42bc3540046c828fd939ae23bcba03f4e5c2ec5b2170b711d97ee755c160457bb58d8daa338e835ec02ae6860bbabb901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083020000018502540be40082a8798203e800a00000000000000000000000000000000000000000000000000000000000000000880000000000000000f863f861800a8405f5e10094100000000000000000000000000000000000000080801ba07e09e26678ed4fac08a249ebe8ed680bf9051a5e14ad223e4b2b9d26e0208f37a05f6e3f188e3e6eab7d7d3b6568f5eac7d687b08d307d3154ccd8c87b4630509bc0").as_slice();
         let block = SealedBlock::decode(&mut block_rlp).unwrap();
-        provider.insert_historical_block(genesis.try_seal_with_senders().unwrap(), None).unwrap();
-        provider
-            .insert_historical_block(block.clone().try_seal_with_senders().unwrap(), None)
-            .unwrap();
+        provider.insert_historical_block(genesis.try_seal_with_senders().unwrap()).unwrap();
+        provider.insert_historical_block(block.clone().try_seal_with_senders().unwrap()).unwrap();
         provider
             .static_file_provider()
             .latest_writer(StaticFileSegment::Headers)
@@ -911,8 +829,6 @@ mod tests {
 
     #[tokio::test]
     async fn sanity_execution_of_block() {
-        // TODO cleanup the setup after https://github.com/paradigmxyz/reth/issues/332
-        // is merged as it has similar framework
         let factory = create_test_provider_factory();
         let provider = factory.provider_rw().unwrap();
         let input = ExecInput { target: Some(1), checkpoint: None };
@@ -920,10 +836,8 @@ mod tests {
         let genesis = SealedBlock::decode(&mut genesis_rlp).unwrap();
         let mut block_rlp = hex!("f90262f901f9a075c371ba45999d87f4542326910a11af515897aebce5265d3f6acd1f1161f82fa01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa098f2dcd87c8ae4083e7017a05456c14eea4b1db2032126e27b3b1563d57d7cc0a08151d548273f6683169524b66ca9fe338b9ce42bc3540046c828fd939ae23bcba03f4e5c2ec5b2170b711d97ee755c160457bb58d8daa338e835ec02ae6860bbabb901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083020000018502540be40082a8798203e800a00000000000000000000000000000000000000000000000000000000000000000880000000000000000f863f861800a8405f5e10094100000000000000000000000000000000000000080801ba07e09e26678ed4fac08a249ebe8ed680bf9051a5e14ad223e4b2b9d26e0208f37a05f6e3f188e3e6eab7d7d3b6568f5eac7d687b08d307d3154ccd8c87b4630509bc0").as_slice();
         let block = SealedBlock::decode(&mut block_rlp).unwrap();
-        provider.insert_historical_block(genesis.try_seal_with_senders().unwrap(), None).unwrap();
-        provider
-            .insert_historical_block(block.clone().try_seal_with_senders().unwrap(), None)
-            .unwrap();
+        provider.insert_historical_block(genesis.try_seal_with_senders().unwrap()).unwrap();
+        provider.insert_historical_block(block.clone().try_seal_with_senders().unwrap()).unwrap();
         provider
             .static_file_provider()
             .latest_writer(StaticFileSegment::Headers)
@@ -933,7 +847,7 @@ mod tests {
         {
             let mut receipts_writer =
                 provider.static_file_provider().latest_writer(StaticFileSegment::Receipts).unwrap();
-            receipts_writer.increment_block(StaticFileSegment::Receipts, 0).unwrap();
+            receipts_writer.increment_block(0).unwrap();
             receipts_writer.commit().unwrap();
         }
         provider.commit().unwrap();
@@ -1061,9 +975,6 @@ mod tests {
 
     #[tokio::test]
     async fn sanity_execute_unwind() {
-        // TODO cleanup the setup after https://github.com/paradigmxyz/reth/issues/332
-        // is merged as it has similar framework
-
         let factory = create_test_provider_factory();
         let provider = factory.provider_rw().unwrap();
         let input = ExecInput { target: Some(1), checkpoint: None };
@@ -1071,10 +982,8 @@ mod tests {
         let genesis = SealedBlock::decode(&mut genesis_rlp).unwrap();
         let mut block_rlp = hex!("f90262f901f9a075c371ba45999d87f4542326910a11af515897aebce5265d3f6acd1f1161f82fa01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa098f2dcd87c8ae4083e7017a05456c14eea4b1db2032126e27b3b1563d57d7cc0a08151d548273f6683169524b66ca9fe338b9ce42bc3540046c828fd939ae23bcba03f4e5c2ec5b2170b711d97ee755c160457bb58d8daa338e835ec02ae6860bbabb901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000083020000018502540be40082a8798203e800a00000000000000000000000000000000000000000000000000000000000000000880000000000000000f863f861800a8405f5e10094100000000000000000000000000000000000000080801ba07e09e26678ed4fac08a249ebe8ed680bf9051a5e14ad223e4b2b9d26e0208f37a05f6e3f188e3e6eab7d7d3b6568f5eac7d687b08d307d3154ccd8c87b4630509bc0").as_slice();
         let block = SealedBlock::decode(&mut block_rlp).unwrap();
-        provider.insert_historical_block(genesis.try_seal_with_senders().unwrap(), None).unwrap();
-        provider
-            .insert_historical_block(block.clone().try_seal_with_senders().unwrap(), None)
-            .unwrap();
+        provider.insert_historical_block(genesis.try_seal_with_senders().unwrap()).unwrap();
+        provider.insert_historical_block(block.clone().try_seal_with_senders().unwrap()).unwrap();
         provider
             .static_file_provider()
             .latest_writer(StaticFileSegment::Headers)
@@ -1084,7 +993,7 @@ mod tests {
         {
             let mut receipts_writer =
                 provider.static_file_provider().latest_writer(StaticFileSegment::Receipts).unwrap();
-            receipts_writer.increment_block(StaticFileSegment::Receipts, 0).unwrap();
+            receipts_writer.increment_block(0).unwrap();
             receipts_writer.commit().unwrap();
         }
         provider.commit().unwrap();
@@ -1190,10 +1099,8 @@ mod tests {
         let genesis = SealedBlock::decode(&mut genesis_rlp).unwrap();
         let mut block_rlp = hex!("f9025ff901f7a0c86e8cc0310ae7c531c758678ddbfd16fc51c8cef8cec650b032de9869e8b94fa01dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347942adc25665018aa1fe0e6bc666dac8fc2697ff9baa050554882fbbda2c2fd93fdc466db9946ea262a67f7a76cc169e714f105ab583da00967f09ef1dfed20c0eacfaa94d5cd4002eda3242ac47eae68972d07b106d192a0e3c8b47fbfc94667ef4cceb17e5cc21e3b1eebd442cebb27f07562b33836290db90100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000008302000001830f42408238108203e800a00000000000000000000000000000000000000000000000000000000000000000880000000000000000f862f860800a83061a8094095e7baea6a6c7c4c2dfeb977efac326af552d8780801ba072ed817487b84ba367d15d2f039b5fc5f087d0a8882fbdf73e8cb49357e1ce30a0403d800545b8fc544f92ce8124e2255f8c3c6af93f28243a120585d4c4c6a2a3c0").as_slice();
         let block = SealedBlock::decode(&mut block_rlp).unwrap();
-        provider.insert_historical_block(genesis.try_seal_with_senders().unwrap(), None).unwrap();
-        provider
-            .insert_historical_block(block.clone().try_seal_with_senders().unwrap(), None)
-            .unwrap();
+        provider.insert_historical_block(genesis.try_seal_with_senders().unwrap()).unwrap();
+        provider.insert_historical_block(block.clone().try_seal_with_senders().unwrap()).unwrap();
         provider
             .static_file_provider()
             .latest_writer(StaticFileSegment::Headers)
@@ -1203,7 +1110,7 @@ mod tests {
         {
             let mut receipts_writer =
                 provider.static_file_provider().latest_writer(StaticFileSegment::Receipts).unwrap();
-            receipts_writer.increment_block(StaticFileSegment::Receipts, 0).unwrap();
+            receipts_writer.increment_block(0).unwrap();
             receipts_writer.commit().unwrap();
         }
         provider.commit().unwrap();

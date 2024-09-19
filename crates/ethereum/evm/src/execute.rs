@@ -4,39 +4,40 @@ use crate::{
     dao_fork::{DAO_HARDFORK_BENEFICIARY, DAO_HARDKFORK_ACCOUNTS},
     EthEvmConfig,
 };
-use reth_chainspec::{ChainSpec, MAINNET};
+use alloc::{boxed::Box, sync::Arc, vec, vec::Vec};
+use core::fmt::Display;
+use reth_chainspec::{ChainSpec, EthereumHardforks, MAINNET};
 use reth_ethereum_consensus::validate_block_post_execution;
 use reth_evm::{
     execute::{
         BatchExecutor, BlockExecutionError, BlockExecutionInput, BlockExecutionOutput,
         BlockExecutorProvider, BlockValidationError, Executor, ProviderError,
     },
+    system_calls::{
+        apply_beacon_root_contract_call, apply_blockhashes_contract_call,
+        apply_consolidation_requests_contract_call, apply_withdrawal_requests_contract_call,
+    },
     ConfigureEvm,
 };
 use reth_execution_types::ExecutionOutcome;
 use reth_primitives::{
-    BlockNumber, BlockWithSenders, Hardfork, Header, Receipt, Request, Withdrawals, U256,
+    BlockNumber, BlockWithSenders, EthereumHardfork, Header, Receipt, Request, U256,
 };
 use reth_prune_types::PruneModes;
 use reth_revm::{
-    batch::{BlockBatchRecord, BlockExecutorStats},
-    db::states::bundle_state::BundleRetention,
-    state_change::{
-        apply_beacon_root_contract_call, apply_blockhashes_update,
-        apply_withdrawal_requests_contract_call, post_block_balance_increments,
+    batch::BlockBatchRecord,
+    db::{
+        states::{bundle_state::BundleRetention, StorageSlot},
+        BundleAccount, State,
     },
-    Evm, State,
+    state_change::post_block_balance_increments,
+    Evm,
 };
 use revm_primitives::{
     db::{Database, DatabaseCommit},
     BlockEnv, CfgEnvWithHandlerCfg, EnvWithHandlerCfg, ResultAndState,
 };
-
-#[cfg(not(feature = "std"))]
-use alloc::{sync::Arc, vec, vec::Vec};
-
-#[cfg(feature = "std")]
-use std::sync::Arc;
+use std::collections::hash_map::Entry;
 
 /// Provides executors to execute regular ethereum blocks
 #[derive(Debug, Clone)]
@@ -48,7 +49,7 @@ pub struct EthExecutorProvider<EvmConfig = EthEvmConfig> {
 impl EthExecutorProvider {
     /// Creates a new default ethereum executor provider.
     pub fn ethereum(chain_spec: Arc<ChainSpec>) -> Self {
-        Self::new(chain_spec, Default::default())
+        Self::new(chain_spec.clone(), EthEvmConfig::new(chain_spec))
     }
 
     /// Returns a new provider for the mainnet.
@@ -66,11 +67,11 @@ impl<EvmConfig> EthExecutorProvider<EvmConfig> {
 
 impl<EvmConfig> EthExecutorProvider<EvmConfig>
 where
-    EvmConfig: ConfigureEvm,
+    EvmConfig: ConfigureEvm<Header = Header>,
 {
     fn eth_executor<DB>(&self, db: DB) -> EthBlockExecutor<EvmConfig, DB>
     where
-        DB: Database<Error = ProviderError>,
+        DB: Database<Error: Into<ProviderError>>,
     {
         EthBlockExecutor::new(
             self.chain_spec.clone(),
@@ -82,29 +83,27 @@ where
 
 impl<EvmConfig> BlockExecutorProvider for EthExecutorProvider<EvmConfig>
 where
-    EvmConfig: ConfigureEvm,
+    EvmConfig: ConfigureEvm<Header = Header>,
 {
-    type Executor<DB: Database<Error = ProviderError>> = EthBlockExecutor<EvmConfig, DB>;
+    type Executor<DB: Database<Error: Into<ProviderError> + Display>> =
+        EthBlockExecutor<EvmConfig, DB>;
 
-    type BatchExecutor<DB: Database<Error = ProviderError>> = EthBatchExecutor<EvmConfig, DB>;
+    type BatchExecutor<DB: Database<Error: Into<ProviderError> + Display>> =
+        EthBatchExecutor<EvmConfig, DB>;
 
     fn executor<DB>(&self, db: DB) -> Self::Executor<DB>
     where
-        DB: Database<Error = ProviderError>,
+        DB: Database<Error: Into<ProviderError> + Display>,
     {
         self.eth_executor(db)
     }
 
-    fn batch_executor<DB>(&self, db: DB, prune_modes: PruneModes) -> Self::BatchExecutor<DB>
+    fn batch_executor<DB>(&self, db: DB) -> Self::BatchExecutor<DB>
     where
-        DB: Database<Error = ProviderError>,
+        DB: Database<Error: Into<ProviderError> + Display>,
     {
         let executor = self.eth_executor(db);
-        EthBatchExecutor {
-            executor,
-            batch_record: BlockBatchRecord::new(prune_modes),
-            stats: BlockExecutorStats::default(),
-        }
+        EthBatchExecutor { executor, batch_record: BlockBatchRecord::default() }
     }
 }
 
@@ -127,7 +126,7 @@ struct EthEvmExecutor<EvmConfig> {
 
 impl<EvmConfig> EthEvmExecutor<EvmConfig>
 where
-    EvmConfig: ConfigureEvm,
+    EvmConfig: ConfigureEvm<Header = Header>,
 {
     /// Executes the transactions in the block and returns the receipts of the transactions in the
     /// block, the total gas used and the list of EIP-7685 [requests](Request).
@@ -145,22 +144,25 @@ where
         mut evm: Evm<'_, Ext, &mut State<DB>>,
     ) -> Result<EthExecuteOutput, BlockExecutionError>
     where
-        DB: Database<Error = ProviderError>,
+        DB: Database,
+        DB::Error: Into<ProviderError> + Display,
     {
         // apply pre execution changes
         apply_beacon_root_contract_call(
+            &self.evm_config,
             &self.chain_spec,
             block.timestamp,
             block.number,
             block.parent_beacon_block_root,
             &mut evm,
         )?;
-        apply_blockhashes_update(
-            evm.db_mut(),
+        apply_blockhashes_contract_call(
+            &self.evm_config,
             &self.chain_spec,
             block.timestamp,
             block.number,
             block.parent_hash,
+            &mut evm,
         )?;
 
         // execute transactions
@@ -178,14 +180,15 @@ where
                 .into())
             }
 
-            EvmConfig::fill_tx_env(evm.tx_mut(), transaction, *sender);
+            self.evm_config.fill_tx_env(evm.tx_mut(), transaction, *sender);
 
             // Execute transaction.
             let ResultAndState { result, state } = evm.transact().map_err(move |err| {
+                let new_err = err.map_db_err(|e| e.into());
                 // Ensure hash is calculated for error log, if not already done
                 BlockValidationError::EVM {
                     hash: transaction.recalculate_hash(),
-                    error: err.into(),
+                    error: Box::new(new_err),
                 }
             })?;
             evm.db_mut().commit(state);
@@ -215,9 +218,14 @@ where
                 crate::eip6110::parse_deposits_from_receipts(&self.chain_spec, &receipts)?;
 
             // Collect all EIP-7685 requests
-            let withdrawal_requests = apply_withdrawal_requests_contract_call(&mut evm)?;
+            let withdrawal_requests =
+                apply_withdrawal_requests_contract_call(&self.evm_config, &mut evm)?;
 
-            [deposit_requests, withdrawal_requests].concat()
+            // Collect all EIP-7251 requests
+            let consolidation_requests =
+                apply_consolidation_requests_contract_call(&self.evm_config, &mut evm)?;
+
+            [deposit_requests, withdrawal_requests, consolidation_requests].concat()
         } else {
             vec![]
         };
@@ -259,8 +267,8 @@ impl<EvmConfig, DB> EthBlockExecutor<EvmConfig, DB> {
 
 impl<EvmConfig, DB> EthBlockExecutor<EvmConfig, DB>
 where
-    EvmConfig: ConfigureEvm,
-    DB: Database<Error = ProviderError>,
+    EvmConfig: ConfigureEvm<Header = Header>,
+    DB: Database<Error: Into<ProviderError> + Display>,
 {
     /// Configures a new evm configuration and block environment for the given block.
     ///
@@ -270,10 +278,9 @@ where
     fn evm_env_for_block(&self, header: &Header, total_difficulty: U256) -> EnvWithHandlerCfg {
         let mut cfg = CfgEnvWithHandlerCfg::new(Default::default(), Default::default());
         let mut block_env = BlockEnv::default();
-        EvmConfig::fill_cfg_and_block_env(
+        self.executor.evm_config.fill_cfg_and_block_env(
             &mut cfg,
             &mut block_env,
-            self.chain_spec(),
             header,
             total_difficulty,
         );
@@ -322,19 +329,11 @@ where
         block: &BlockWithSenders,
         total_difficulty: U256,
     ) -> Result<(), BlockExecutionError> {
-        let mut balance_increments = post_block_balance_increments(
-            self.chain_spec(),
-            block.number,
-            block.difficulty,
-            block.beneficiary,
-            block.timestamp,
-            total_difficulty,
-            &block.ommers,
-            block.withdrawals.as_ref().map(Withdrawals::as_ref),
-        );
+        let mut balance_increments =
+            post_block_balance_increments(self.chain_spec(), block, total_difficulty);
 
         // Irregular state change at Ethereum DAO hardfork
-        if self.chain_spec().fork(Hardfork::Dao).transitions_at_block(block.number) {
+        if self.chain_spec().fork(EthereumHardfork::Dao).transitions_at_block(block.number) {
             // drain balances from hardcoded addresses.
             let drained_balance: u128 = self
                 .state
@@ -357,20 +356,18 @@ where
 
 impl<EvmConfig, DB> Executor<DB> for EthBlockExecutor<EvmConfig, DB>
 where
-    EvmConfig: ConfigureEvm,
-    DB: Database<Error = ProviderError>,
+    EvmConfig: ConfigureEvm<Header = Header>,
+    DB: Database<Error: Into<ProviderError> + Display>,
 {
     type Input<'a> = BlockExecutionInput<'a, BlockWithSenders>;
     type Output = BlockExecutionOutput<Receipt>;
     type Error = BlockExecutionError;
 
-    /// Executes the block and commits the state changes.
+    /// Executes the block and commits the changes to the internal state.
     ///
     /// Returns the receipts of the transactions in the block.
     ///
     /// Returns an error if the block could not be executed or failed verification.
-    ///
-    /// State changes are committed to the database.
     fn execute(mut self, input: Self::Input<'_>) -> Result<Self::Output, Self::Error> {
         let BlockExecutionInput { block, total_difficulty } = input;
         let EthExecuteOutput { receipts, requests, gas_used } =
@@ -380,6 +377,88 @@ where
         self.state.merge_transitions(BundleRetention::Reverts);
 
         Ok(BlockExecutionOutput { state: self.state.take_bundle(), receipts, requests, gas_used })
+    }
+}
+
+/// An executor that retains all cache state from execution in its bundle state.
+#[derive(Debug)]
+pub struct BlockAccessListExecutor<EvmConfig, DB> {
+    /// The executor used to execute single blocks
+    ///
+    /// All state changes are committed to the [State].
+    executor: EthBlockExecutor<EvmConfig, DB>,
+}
+
+impl<EvmConfig, DB> Executor<DB> for BlockAccessListExecutor<EvmConfig, DB>
+where
+    EvmConfig: ConfigureEvm<Header = Header>,
+    DB: Database<Error: Into<ProviderError> + Display>,
+{
+    type Input<'a> = BlockExecutionInput<'a, BlockWithSenders>;
+    type Output = BlockExecutionOutput<Receipt>;
+    type Error = BlockExecutionError;
+
+    /// Executes the block and commits the changes to the internal state.
+    ///
+    /// Returns the receipts of the transactions in the block.
+    ///
+    /// This also returns the accounts from the internal state cache in the bundle state, allowing
+    /// access to not only the state that changed during execution, but also the state accessed
+    /// during execution.
+    ///
+    /// Returns an error if the block could not be executed or failed verification.
+    fn execute(mut self, input: Self::Input<'_>) -> Result<Self::Output, Self::Error> {
+        let BlockExecutionInput { block, total_difficulty } = input;
+        let EthExecuteOutput { receipts, requests, gas_used } =
+            self.executor.execute_without_verification(block, total_difficulty)?;
+
+        // NOTE: we need to merge keep the reverts for the bundle retention
+        self.executor.state.merge_transitions(BundleRetention::Reverts);
+
+        // now, ensure each account from the state is included in the bundle state
+        let mut bundle_state = self.executor.state.take_bundle();
+        for (address, account) in self.executor.state.cache.accounts {
+            // convert all slots, insert all slots
+            let account_info = account.account_info();
+            let account_storage = account.account.map(|a| a.storage).unwrap_or_default();
+
+            match bundle_state.state.entry(address) {
+                Entry::Vacant(entry) => {
+                    // we have to add the entire account here
+                    let extracted_storage = account_storage
+                        .into_iter()
+                        .map(|(k, v)| {
+                            (k, StorageSlot { previous_or_original_value: v, present_value: v })
+                        })
+                        .collect();
+
+                    let bundle_account = BundleAccount {
+                        info: account_info.clone(),
+                        original_info: account_info,
+                        storage: extracted_storage,
+                        status: account.status,
+                    };
+                    entry.insert(bundle_account);
+                }
+                Entry::Occupied(mut entry) => {
+                    // only add slots that are unchanged
+                    let current_account = entry.get_mut();
+
+                    // iterate over all storage slots, checking keys that are not in the bundle
+                    // state
+                    for (k, v) in account_storage {
+                        if let Entry::Vacant(storage_entry) = current_account.storage.entry(k) {
+                            storage_entry.insert(StorageSlot {
+                                previous_or_original_value: v,
+                                present_value: v,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(BlockExecutionOutput { state: bundle_state, receipts, requests, gas_used })
     }
 }
 
@@ -394,7 +473,6 @@ pub struct EthBatchExecutor<EvmConfig, DB> {
     executor: EthBlockExecutor<EvmConfig, DB>,
     /// Keeps track of the batch and records receipts based on the configured prune mode
     batch_record: BlockBatchRecord,
-    stats: BlockExecutorStats,
 }
 
 impl<EvmConfig, DB> EthBatchExecutor<EvmConfig, DB> {
@@ -407,8 +485,8 @@ impl<EvmConfig, DB> EthBatchExecutor<EvmConfig, DB> {
 
 impl<EvmConfig, DB> BatchExecutor<DB> for EthBatchExecutor<EvmConfig, DB>
 where
-    EvmConfig: ConfigureEvm,
-    DB: Database<Error = ProviderError>,
+    EvmConfig: ConfigureEvm<Header = Header>,
+    DB: Database<Error: Into<ProviderError> + Display>,
 {
     type Input<'a> = BlockExecutionInput<'a, BlockWithSenders>;
     type Output = ExecutionOutcome;
@@ -416,6 +494,11 @@ where
 
     fn execute_and_verify_one(&mut self, input: Self::Input<'_>) -> Result<(), Self::Error> {
         let BlockExecutionInput { block, total_difficulty } = input;
+
+        if self.batch_record.first_block().is_none() {
+            self.batch_record.set_first_block(block.number);
+        }
+
         let EthExecuteOutput { receipts, requests, gas_used: _ } =
             self.executor.execute_without_verification(block, total_difficulty)?;
 
@@ -431,16 +514,10 @@ where
         // store requests in the set
         self.batch_record.save_requests(requests);
 
-        if self.batch_record.first_block().is_none() {
-            self.batch_record.set_first_block(block.number);
-        }
-
         Ok(())
     }
 
     fn finalize(mut self) -> Self::Output {
-        self.stats.log_debug();
-
         ExecutionOutcome::new(
             self.executor.state.take_bundle(),
             self.batch_record.take_receipts(),
@@ -453,6 +530,10 @@ where
         self.batch_record.set_tip(tip);
     }
 
+    fn set_prune_modes(&mut self, prune_modes: PruneModes) {
+        self.batch_record.set_prune_modes(prune_modes);
+    }
+
     fn size_hint(&self) -> Option<usize> {
         Some(self.executor.state.bundle_state.size_hint())
     }
@@ -462,7 +543,7 @@ where
 mod tests {
     use super::*;
     use alloy_eips::{
-        eip2935::HISTORY_STORAGE_ADDRESS,
+        eip2935::{HISTORY_STORAGE_ADDRESS, HISTORY_STORAGE_CODE},
         eip4788::{BEACON_ROOTS_ADDRESS, BEACON_ROOTS_CODE, SYSTEM_ADDRESS},
         eip7002::{WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS, WITHDRAWAL_REQUEST_PREDEPLOY_CODE},
     };
@@ -518,7 +599,7 @@ mod tests {
     }
 
     fn executor_provider(chain_spec: Arc<ChainSpec>) -> EthExecutorProvider<EthEvmConfig> {
-        EthExecutorProvider { chain_spec, evm_config: Default::default() }
+        EthExecutorProvider { evm_config: EthEvmConfig::new(chain_spec.clone()), chain_spec }
     }
 
     #[test]
@@ -531,7 +612,7 @@ mod tests {
         let chain_spec = Arc::new(
             ChainSpecBuilder::from(&*MAINNET)
                 .shanghai_activated()
-                .with_fork(Hardfork::Cancun, ForkCondition::Timestamp(1))
+                .with_fork(EthereumHardfork::Cancun, ForkCondition::Timestamp(1))
                 .build(),
         );
 
@@ -628,7 +709,7 @@ mod tests {
         let chain_spec = Arc::new(
             ChainSpecBuilder::from(&*MAINNET)
                 .shanghai_activated()
-                .with_fork(Hardfork::Cancun, ForkCondition::Timestamp(1))
+                .with_fork(EthereumHardfork::Cancun, ForkCondition::Timestamp(1))
                 .build(),
         );
 
@@ -636,7 +717,7 @@ mod tests {
 
         // attempt to execute an empty block with parent beacon block root, this should not fail
         provider
-            .batch_executor(StateProviderDatabase::new(&db), PruneModes::none())
+            .batch_executor(StateProviderDatabase::new(&db))
             .execute_and_verify_one(
                 (
                     &BlockWithSenders {
@@ -671,7 +752,7 @@ mod tests {
         let chain_spec = Arc::new(
             ChainSpecBuilder::from(&*MAINNET)
                 .shanghai_activated()
-                .with_fork(Hardfork::Cancun, ForkCondition::Timestamp(1))
+                .with_fork(EthereumHardfork::Cancun, ForkCondition::Timestamp(1))
                 .build(),
         );
 
@@ -686,8 +767,7 @@ mod tests {
             ..Header::default()
         };
 
-        let mut executor =
-            provider.batch_executor(StateProviderDatabase::new(&db), PruneModes::none());
+        let mut executor = provider.batch_executor(StateProviderDatabase::new(&db));
 
         // attempt to execute an empty block with parent beacon block root, this should not fail
         executor
@@ -724,14 +804,13 @@ mod tests {
         let chain_spec = Arc::new(
             ChainSpecBuilder::from(&*MAINNET)
                 .shanghai_activated()
-                .with_fork(Hardfork::Cancun, ForkCondition::Timestamp(0))
+                .with_fork(EthereumHardfork::Cancun, ForkCondition::Timestamp(0))
                 .build(),
         );
 
-        let mut header = chain_spec.genesis_header();
+        let mut header = chain_spec.genesis_header().clone();
         let provider = executor_provider(chain_spec);
-        let mut executor =
-            provider.batch_executor(StateProviderDatabase::new(&db), PruneModes::none());
+        let mut executor = provider.batch_executor(StateProviderDatabase::new(&db));
 
         // attempt to execute the genesis block with non-zero parent beacon block root, expect err
         header.parent_beacon_block_root = Some(B256::with_last_byte(0x69));
@@ -811,15 +890,14 @@ mod tests {
         let chain_spec = Arc::new(
             ChainSpecBuilder::from(&*MAINNET)
                 .shanghai_activated()
-                .with_fork(Hardfork::Cancun, ForkCondition::Timestamp(1))
+                .with_fork(EthereumHardfork::Cancun, ForkCondition::Timestamp(1))
                 .build(),
         );
 
         let provider = executor_provider(chain_spec);
 
         // execute header
-        let mut executor =
-            provider.batch_executor(StateProviderDatabase::new(&db), PruneModes::none());
+        let mut executor = provider.batch_executor(StateProviderDatabase::new(&db));
 
         // Now execute a block with the fixed header, ensure that it does not fail
         executor
@@ -866,11 +944,26 @@ mod tests {
         assert_eq!(parent_beacon_block_root_storage, U256::from(0x69));
     }
 
+    /// Create a state provider with blockhashes and the EIP-2935 system contract.
     fn create_state_provider_with_block_hashes(latest_block: u64) -> StateProviderTest {
         let mut db = StateProviderTest::default();
         for block_number in 0..=latest_block {
             db.insert_block_hash(block_number, keccak256(block_number.to_string()));
         }
+
+        let blockhashes_contract_account = Account {
+            balance: U256::ZERO,
+            bytecode_hash: Some(keccak256(HISTORY_STORAGE_CODE.clone())),
+            nonce: 1,
+        };
+
+        db.insert_account(
+            HISTORY_STORAGE_ADDRESS,
+            blockhashes_contract_account,
+            Some(HISTORY_STORAGE_CODE.clone()),
+            HashMap::new(),
+        );
+
         db
     }
 
@@ -881,13 +974,12 @@ mod tests {
         let chain_spec = Arc::new(
             ChainSpecBuilder::from(&*MAINNET)
                 .shanghai_activated()
-                .with_fork(Hardfork::Prague, ForkCondition::Never)
+                .with_fork(EthereumHardfork::Prague, ForkCondition::Never)
                 .build(),
         );
 
         let provider = executor_provider(chain_spec);
-        let mut executor =
-            provider.batch_executor(StateProviderDatabase::new(&db), PruneModes::none());
+        let mut executor = provider.batch_executor(StateProviderDatabase::new(&db));
 
         // construct the header for block one
         let header = Header { timestamp: 1, number: 1, ..Header::default() };
@@ -917,9 +1009,9 @@ mod tests {
         // ensure that the block hash was *not* written to storage, since this is before the fork
         // was activated
         //
-        // we load the account first, which should also not exist, because revm expects it to be
+        // we load the account first, because revm expects it to be
         // loaded
-        assert!(executor.state_mut().basic(HISTORY_STORAGE_ADDRESS).unwrap().is_none());
+        executor.state_mut().basic(HISTORY_STORAGE_ADDRESS).unwrap();
         assert!(executor
             .state_mut()
             .storage(HISTORY_STORAGE_ADDRESS, U256::ZERO)
@@ -934,14 +1026,13 @@ mod tests {
         let chain_spec = Arc::new(
             ChainSpecBuilder::from(&*MAINNET)
                 .shanghai_activated()
-                .with_fork(Hardfork::Prague, ForkCondition::Timestamp(0))
+                .with_fork(EthereumHardfork::Prague, ForkCondition::Timestamp(0))
                 .build(),
         );
 
-        let header = chain_spec.genesis_header();
+        let header = chain_spec.genesis_header().clone();
         let provider = executor_provider(chain_spec);
-        let mut executor =
-            provider.batch_executor(StateProviderDatabase::new(&db), PruneModes::none());
+        let mut executor = provider.batch_executor(StateProviderDatabase::new(&db));
 
         // attempt to execute genesis block, this should not fail
         executor
@@ -968,9 +1059,9 @@ mod tests {
         // ensure that the block hash was *not* written to storage, since there are no blocks
         // preceding genesis
         //
-        // we load the account first, which should also not exist, because revm expects it to be
+        // we load the account first, because revm expects it to be
         // loaded
-        assert!(executor.state_mut().basic(HISTORY_STORAGE_ADDRESS).unwrap().is_none());
+        executor.state_mut().basic(HISTORY_STORAGE_ADDRESS).unwrap();
         assert!(executor
             .state_mut()
             .storage(HISTORY_STORAGE_ADDRESS, U256::ZERO)
@@ -986,7 +1077,7 @@ mod tests {
         let chain_spec = Arc::new(
             ChainSpecBuilder::from(&*MAINNET)
                 .shanghai_activated()
-                .with_fork(Hardfork::Prague, ForkCondition::Timestamp(1))
+                .with_fork(EthereumHardfork::Prague, ForkCondition::Timestamp(1))
                 .build(),
         );
 
@@ -998,8 +1089,7 @@ mod tests {
             ..Header::default()
         };
         let provider = executor_provider(chain_spec);
-        let mut executor =
-            provider.batch_executor(StateProviderDatabase::new(&db), PruneModes::none());
+        let mut executor = provider.batch_executor(StateProviderDatabase::new(&db));
 
         // attempt to execute the fork activation block, this should not fail
         executor
@@ -1049,13 +1139,12 @@ mod tests {
         let chain_spec = Arc::new(
             ChainSpecBuilder::from(&*MAINNET)
                 .shanghai_activated()
-                .with_fork(Hardfork::Prague, ForkCondition::Timestamp(1))
+                .with_fork(EthereumHardfork::Prague, ForkCondition::Timestamp(1))
                 .build(),
         );
 
         let provider = executor_provider(chain_spec);
-        let mut executor =
-            provider.batch_executor(StateProviderDatabase::new(&db), PruneModes::none());
+        let mut executor = provider.batch_executor(StateProviderDatabase::new(&db));
 
         let header = Header {
             parent_hash: B256::random(),
@@ -1108,17 +1197,16 @@ mod tests {
         let chain_spec = Arc::new(
             ChainSpecBuilder::from(&*MAINNET)
                 .shanghai_activated()
-                .with_fork(Hardfork::Prague, ForkCondition::Timestamp(0))
+                .with_fork(EthereumHardfork::Prague, ForkCondition::Timestamp(0))
                 .build(),
         );
 
-        let mut header = chain_spec.genesis_header();
+        let mut header = chain_spec.genesis_header().clone();
         header.requests_root = Some(EMPTY_ROOT_HASH);
         let header_hash = header.hash_slow();
 
         let provider = executor_provider(chain_spec);
-        let mut executor =
-            provider.batch_executor(StateProviderDatabase::new(&db), PruneModes::none());
+        let mut executor = provider.batch_executor(StateProviderDatabase::new(&db));
 
         // attempt to execute the genesis block, this should not fail
         executor
@@ -1143,7 +1231,10 @@ mod tests {
             );
 
         // nothing should be written as the genesis has no ancestors
-        assert!(executor.state_mut().basic(HISTORY_STORAGE_ADDRESS).unwrap().is_none());
+        //
+        // we load the account first, because revm expects it to be
+        // loaded
+        executor.state_mut().basic(HISTORY_STORAGE_ADDRESS).unwrap();
         assert!(executor
             .state_mut()
             .storage(HISTORY_STORAGE_ADDRESS, U256::ZERO)
@@ -1245,7 +1336,7 @@ mod tests {
         let chain_spec = Arc::new(
             ChainSpecBuilder::from(&*MAINNET)
                 .shanghai_activated()
-                .with_fork(Hardfork::Prague, ForkCondition::Timestamp(0))
+                .with_fork(EthereumHardfork::Prague, ForkCondition::Timestamp(0))
                 .build(),
         );
 
@@ -1268,7 +1359,7 @@ mod tests {
         let input: Bytes = [&validator_public_key[..], &withdrawal_amount[..]].concat().into();
         assert_eq!(input.len(), 56);
 
-        let mut header = chain_spec.genesis_header();
+        let mut header = chain_spec.genesis_header().clone();
         header.gas_limit = 1_500_000;
         header.gas_used = 134_807;
         header.receipts_root =
@@ -1326,7 +1417,7 @@ mod tests {
         let chain_spec = Arc::new(
             ChainSpecBuilder::from(&*MAINNET)
                 .shanghai_activated()
-                .with_fork(Hardfork::Prague, ForkCondition::Timestamp(0))
+                .with_fork(EthereumHardfork::Prague, ForkCondition::Timestamp(0))
                 .build(),
         );
 
@@ -1357,7 +1448,7 @@ mod tests {
         assert_eq!(input.len(), 56);
 
         // Create a genesis block header with a specified gas limit and gas used
-        let mut header = chain_spec.genesis_header();
+        let mut header = chain_spec.genesis_header().clone();
         header.gas_limit = 1_500_000;
         header.gas_used = 134_807;
         header.receipts_root =

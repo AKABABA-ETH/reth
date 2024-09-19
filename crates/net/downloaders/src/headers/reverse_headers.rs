@@ -2,6 +2,7 @@
 
 use super::task::TaskDownloader;
 use crate::metrics::HeaderDownloaderMetrics;
+use alloy_primitives::{BlockNumber, B256};
 use futures::{stream::Stream, FutureExt};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use rayon::prelude::*;
@@ -10,16 +11,14 @@ use reth_consensus::Consensus;
 use reth_network_p2p::{
     error::{DownloadError, DownloadResult, PeerRequestResult},
     headers::{
-        client::{HeadersClient, HeadersRequest},
+        client::{HeadersClient, HeadersDirection, HeadersRequest},
         downloader::{validate_header_download, HeaderDownloader, SyncTarget},
         error::{HeadersDownloaderError, HeadersDownloaderResult},
     },
     priority::Priority,
 };
 use reth_network_peers::PeerId;
-use reth_primitives::{
-    BlockHashOrNumber, BlockNumber, GotExpected, Header, HeadersDirection, SealedHeader, B256,
-};
+use reth_primitives::{BlockHashOrNumber, GotExpected, Header, SealedHeader};
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use std::{
     cmp::{Ordering, Reverse},
@@ -653,12 +652,7 @@ where
 {
     fn update_local_head(&mut self, head: SealedHeader) {
         // ensure we're only yielding headers that are in range and follow the current local head.
-        while self
-            .queued_validated_headers
-            .last()
-            .map(|last| last.number <= head.number)
-            .unwrap_or_default()
-        {
+        while self.queued_validated_headers.last().is_some_and(|last| last.number <= head.number) {
             // headers are sorted high to low
             self.queued_validated_headers.pop();
         }

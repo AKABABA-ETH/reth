@@ -1,5 +1,6 @@
-use reth_chainspec::{Chain, ChainSpec, Hardfork};
-use reth_primitives::{constants::ETH_TO_WEI, BlockNumber, U256};
+use alloy_primitives::{BlockNumber, U256};
+use reth_chainspec::{ChainSpec, EthereumHardfork};
+use reth_primitives::constants::ETH_TO_WEI;
 
 /// Calculates the base block reward.
 ///
@@ -26,9 +27,7 @@ pub fn base_block_reward(
     block_difficulty: U256,
     total_difficulty: U256,
 ) -> Option<u128> {
-    if chain_spec.fork(Hardfork::Paris).active_at_ttd(total_difficulty, block_difficulty) ||
-        chain_spec.chain == Chain::goerli()
-    {
+    if chain_spec.fork(EthereumHardfork::Paris).active_at_ttd(total_difficulty, block_difficulty) {
         None
     } else {
         Some(base_block_reward_pre_merge(chain_spec, block_number))
@@ -39,9 +38,9 @@ pub fn base_block_reward(
 ///
 /// Caution: The caller must ensure that the block number is before the merge.
 pub fn base_block_reward_pre_merge(chain_spec: &ChainSpec, block_number: BlockNumber) -> u128 {
-    if chain_spec.fork(Hardfork::Constantinople).active_at_block(block_number) {
+    if chain_spec.fork(EthereumHardfork::Constantinople).active_at_block(block_number) {
         ETH_TO_WEI * 2
-    } else if chain_spec.fork(Hardfork::Byzantium).active_at_block(block_number) {
+    } else if chain_spec.fork(EthereumHardfork::Byzantium).active_at_block(block_number) {
         ETH_TO_WEI * 3
     } else {
         ETH_TO_WEI * 5
@@ -59,7 +58,7 @@ pub fn base_block_reward_pre_merge(chain_spec: &ChainSpec, block_number: BlockNu
 /// # use reth_chainspec::MAINNET;
 /// # use reth_consensus_common::calc::{base_block_reward, block_reward};
 /// # use reth_primitives::constants::ETH_TO_WEI;
-/// # use reth_primitives::U256;
+/// # use alloy_primitives::U256;
 /// #
 /// // This is block 126 on mainnet.
 /// let block_number = 126;

@@ -1,19 +1,18 @@
 //! Implements the `GetPooledTransactions` and `PooledTransactions` message types.
 
+use alloy_primitives::B256;
 use alloy_rlp::{RlpDecodableWrapper, RlpEncodableWrapper};
 use derive_more::{Constructor, Deref, IntoIterator};
-use reth_codecs_derive::derive_arbitrary;
+use reth_codecs_derive::add_arbitrary_tests;
 use reth_primitives::{
-    transaction::TransactionConversionError, PooledTransactionsElement, TransactionSigned, B256,
+    transaction::TransactionConversionError, PooledTransactionsElement, TransactionSigned,
 };
 
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
 /// A list of transaction hashes that the peer would like transaction bodies for.
-#[derive_arbitrary(rlp)]
 #[derive(Clone, Debug, PartialEq, Eq, RlpEncodableWrapper, RlpDecodableWrapper, Default)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(any(test, feature = "arbitrary"), derive(arbitrary::Arbitrary))]
+#[add_arbitrary_tests(rlp)]
 pub struct GetPooledTransactions(
     /// The transaction hashes to request transaction bodies for.
     pub Vec<B256>,
@@ -48,7 +47,7 @@ where
     Deref,
     Constructor,
 )]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PooledTransactions(
     /// The transaction bodies, each of which should correspond to a requested hash.
     pub Vec<PooledTransactionsElement>,
@@ -78,10 +77,11 @@ impl FromIterator<PooledTransactionsElement> for PooledTransactions {
 #[cfg(test)]
 mod tests {
     use crate::{message::RequestPair, GetPooledTransactions, PooledTransactions};
+    use alloy_primitives::{hex, TxKind, U256};
     use alloy_rlp::{Decodable, Encodable};
+    use reth_chainspec::MIN_TRANSACTION_GAS;
     use reth_primitives::{
-        hex, PooledTransactionsElement, Signature, Transaction, TransactionSigned, TxEip1559,
-        TxKind, TxLegacy, U256,
+        PooledTransactionsElement, Signature, Transaction, TransactionSigned, TxEip1559, TxLegacy,
     };
     use std::str::FromStr;
 
@@ -129,7 +129,7 @@ mod tests {
                     chain_id: Some(1),
                     nonce: 0x8u64,
                     gas_price: 0x4a817c808,
-                    gas_limit: 0x2e248u64,
+                    gas_limit: 0x2e248,
                     to: TxKind::Call(hex!("3535353535353535353535353535353535353535").into()),
                     value: U256::from(0x200u64),
                     input: Default::default(),
@@ -151,7 +151,7 @@ mod tests {
                     chain_id: Some(1),
                     nonce: 0x09u64,
                     gas_price: 0x4a817c809,
-                    gas_limit: 0x33450u64,
+                    gas_limit: 0x33450,
                     to: TxKind::Call(hex!("3535353535353535353535353535353535353535").into()),
                     value: U256::from(0x2d9u64),
                     input: Default::default(),
@@ -195,7 +195,7 @@ mod tests {
                     chain_id: Some(1),
                     nonce: 0x8u64,
                     gas_price: 0x4a817c808,
-                    gas_limit: 0x2e248u64,
+                    gas_limit: 0x2e248,
                     to: TxKind::Call(hex!("3535353535353535353535353535353535353535").into()),
                     value: U256::from(0x200u64),
                     input: Default::default(),
@@ -217,7 +217,7 @@ mod tests {
                     chain_id: Some(1),
                     nonce: 0x09u64,
                     gas_price: 0x4a817c809,
-                    gas_limit: 0x33450u64,
+                    gas_limit: 0x33450,
                     to: TxKind::Call(hex!("3535353535353535353535353535353535353535").into()),
                     value: U256::from(0x2d9u64),
                     input: Default::default(),
@@ -262,7 +262,7 @@ mod tests {
                     chain_id: Some(4),
                     nonce: 15u64,
                     gas_price: 2200000000,
-                    gas_limit: 34811u64,
+                    gas_limit: 34811,
                     to: TxKind::Call(hex!("cf7f9e66af820a19257a2108375b180b0ec49167").into()),
                     value: U256::from(1234u64),
                     input: Default::default(),
@@ -285,7 +285,7 @@ mod tests {
                     nonce: 26u64,
                     max_priority_fee_per_gas: 1500000000,
                     max_fee_per_gas: 1500000013,
-                    gas_limit: 21000u64,
+                    gas_limit: MIN_TRANSACTION_GAS as u128,
                     to: TxKind::Call(hex!("61815774383099e24810ab832a5b2a5425c154d5").into()),
                     value: U256::from(3000000000000000000u64),
                     input: Default::default(),
@@ -308,7 +308,7 @@ mod tests {
                     chain_id: Some(4),
                     nonce: 3u64,
                     gas_price: 2000000000,
-                    gas_limit: 10000000u64,
+                    gas_limit: 10000000,
                     to: TxKind::Call(hex!("d3e8763675e4c425df46cc3b5c0f6cbdac396046").into()),
                     value: U256::from(1000000000000000u64),
                     input: Default::default(),
@@ -330,7 +330,7 @@ mod tests {
                     chain_id: Some(4),
                     nonce: 1u64,
                     gas_price: 1000000000,
-                    gas_limit: 100000u64,
+                    gas_limit: 100000,
                     to: TxKind::Call(hex!("d3e8763675e4c425df46cc3b5c0f6cbdac396046").into()),
                     value: U256::from(693361000000000u64),
                     input: Default::default(),
@@ -352,7 +352,7 @@ mod tests {
                     chain_id: Some(4),
                     nonce: 2u64,
                     gas_price: 1000000000,
-                    gas_limit: 100000u64,
+                    gas_limit: 100000,
                     to: TxKind::Call(hex!("d3e8763675e4c425df46cc3b5c0f6cbdac396046").into()),
                     value: U256::from(1000000000000000u64),
                     input: Default::default(),
@@ -401,7 +401,7 @@ mod tests {
                     chain_id: Some(4),
                     nonce: 15u64,
                     gas_price: 2200000000,
-                    gas_limit: 34811u64,
+                    gas_limit: 34811,
                     to: TxKind::Call(hex!("cf7f9e66af820a19257a2108375b180b0ec49167").into()),
                     value: U256::from(1234u64),
                     input: Default::default(),
@@ -424,7 +424,7 @@ mod tests {
                     nonce: 26u64,
                     max_priority_fee_per_gas: 1500000000,
                     max_fee_per_gas: 1500000013,
-                    gas_limit: 21000u64,
+                    gas_limit: MIN_TRANSACTION_GAS as u128,
                     to: TxKind::Call(hex!("61815774383099e24810ab832a5b2a5425c154d5").into()),
                     value: U256::from(3000000000000000000u64),
                     input: Default::default(),
@@ -447,7 +447,7 @@ mod tests {
                     chain_id: Some(4),
                     nonce: 3u64,
                     gas_price: 2000000000,
-                    gas_limit: 10000000u64,
+                    gas_limit: 10000000,
                     to: TxKind::Call(hex!("d3e8763675e4c425df46cc3b5c0f6cbdac396046").into()),
                     value: U256::from(1000000000000000u64),
                     input: Default::default(),
@@ -469,7 +469,7 @@ mod tests {
                     chain_id: Some(4),
                     nonce: 1u64,
                     gas_price: 1000000000,
-                    gas_limit: 100000u64,
+                    gas_limit: 100000,
                     to: TxKind::Call(hex!("d3e8763675e4c425df46cc3b5c0f6cbdac396046").into()),
                     value: U256::from(693361000000000u64),
                     input: Default::default(),
@@ -491,7 +491,7 @@ mod tests {
                     chain_id: Some(4),
                     nonce: 2u64,
                     gas_price: 1000000000,
-                    gas_limit: 100000u64,
+                    gas_limit: 100000,
                     to: TxKind::Call(hex!("d3e8763675e4c425df46cc3b5c0f6cbdac396046").into()),
                     value: U256::from(1000000000000000u64),
                     input: Default::default(),

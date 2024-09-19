@@ -9,18 +9,16 @@
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 mod compression;
-mod filters;
 mod segment;
 
 use alloy_primitives::BlockNumber;
 pub use compression::Compression;
-pub use filters::{Filters, InclusionFilter, PerfectHashingFunction};
 pub use segment::{SegmentConfig, SegmentHeader, SegmentRangeInclusive, StaticFileSegment};
 
 /// Default static file block count.
 pub const BLOCKS_PER_STATIC_FILE: u64 = 500_000;
 
-/// Highest static file block numbers, per data part.
+/// Highest static file block numbers, per data segment.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub struct HighestStaticFiles {
     /// Highest static file block of headers, inclusive.
@@ -51,6 +49,11 @@ impl HighestStaticFiles {
             StaticFileSegment::Transactions => &mut self.transactions,
             StaticFileSegment::Receipts => &mut self.receipts,
         }
+    }
+
+    /// Returns the minimum block of all segments.
+    pub fn min(&self) -> Option<u64> {
+        [self.headers, self.transactions, self.receipts].iter().filter_map(|&option| option).min()
     }
 
     /// Returns the maximum block of all segments.

@@ -5,15 +5,15 @@ use crate::{PipelineTarget, StageCheckpoint, StageId};
 use alloy_primitives::{BlockNumber, B256};
 pub use event::*;
 use futures_util::Future;
-use reth_db_api::database::Database;
+use reth_node_types::NodeTypesWithDB;
 use reth_primitives_traits::constants::BEACON_CONSENSUS_REORG_UNWIND_DEPTH;
 use reth_provider::{
-    providers::StaticFileWriter, FinalizedBlockReader, FinalizedBlockWriter, ProviderFactory,
-    StageCheckpointReader, StageCheckpointWriter, StaticFileProviderFactory,
+    providers::ProviderNodeTypes, writer::UnifiedStorageWriter, FinalizedBlockReader,
+    FinalizedBlockWriter, ProviderFactory, StageCheckpointReader, StageCheckpointWriter,
+    StaticFileProviderFactory,
 };
 use reth_prune::PrunerBuilder;
 use reth_static_file::StaticFileProducer;
-use reth_static_file_types::HighestStaticFiles;
 use reth_tokio_util::{EventSender, EventStream};
 use std::pin::Pin;
 use tokio::sync::watch;
@@ -37,10 +37,10 @@ pub(crate) type BoxedStage<DB> = Box<dyn Stage<DB>>;
 
 /// The future that returns the owned pipeline and the result of the pipeline run. See
 /// [`Pipeline::run_as_fut`].
-pub type PipelineFut<DB> = Pin<Box<dyn Future<Output = PipelineWithResult<DB>> + Send>>;
+pub type PipelineFut<N> = Pin<Box<dyn Future<Output = PipelineWithResult<N>> + Send>>;
 
 /// The pipeline type itself with the result of [`Pipeline::run_as_fut`]
-pub type PipelineWithResult<DB> = (Pipeline<DB>, Result<ControlFlow, PipelineError>);
+pub type PipelineWithResult<N> = (Pipeline<N>, Result<ControlFlow, PipelineError>);
 
 #[cfg_attr(doc, aquamarine::aquamarine)]
 /// A staged sync pipeline.
@@ -64,14 +64,14 @@ pub type PipelineWithResult<DB> = (Pipeline<DB>, Result<ControlFlow, PipelineErr
 /// # Defaults
 ///
 /// The [`DefaultStages`](crate::sets::DefaultStages) are used to fully sync reth.
-pub struct Pipeline<DB: Database> {
+pub struct Pipeline<N: NodeTypesWithDB> {
     /// Provider factory.
-    provider_factory: ProviderFactory<DB>,
+    provider_factory: ProviderFactory<N>,
     /// All configured stages in the order they will be executed.
-    stages: Vec<BoxedStage<DB>>,
+    stages: Vec<BoxedStage<N::DB>>,
     /// The maximum block number to sync to.
     max_block: Option<BlockNumber>,
-    static_file_producer: StaticFileProducer<DB>,
+    static_file_producer: StaticFileProducer<ProviderFactory<N>>,
     /// Sender for events the pipeline emits.
     event_sender: EventSender<PipelineEvent>,
     /// Keeps track of the progress of the pipeline.
@@ -81,12 +81,9 @@ pub struct Pipeline<DB: Database> {
     metrics_tx: Option<MetricEventsSender>,
 }
 
-impl<DB> Pipeline<DB>
-where
-    DB: Database + 'static,
-{
+impl<N: ProviderNodeTypes> Pipeline<N> {
     /// Construct a pipeline using a [`PipelineBuilder`].
-    pub fn builder() -> PipelineBuilder<DB> {
+    pub fn builder() -> PipelineBuilder<N::DB> {
         PipelineBuilder::default()
     }
 
@@ -108,7 +105,9 @@ where
     pub fn events(&self) -> EventStream<PipelineEvent> {
         self.event_sender.new_listener()
     }
+}
 
+impl<N: ProviderNodeTypes> Pipeline<N> {
     /// Registers progress metrics for each registered stage
     pub fn register_metrics(&mut self) -> Result<(), PipelineError> {
         let Some(metrics_tx) = &mut self.metrics_tx else { return Ok(()) };
@@ -128,7 +127,7 @@ where
     /// Consume the pipeline and run it until it reaches the provided tip, if set. Return the
     /// pipeline and its result as a future.
     #[track_caller]
-    pub fn run_as_fut(mut self, target: Option<PipelineTarget>) -> PipelineFut<DB> {
+    pub fn run_as_fut(mut self, target: Option<PipelineTarget>) -> PipelineFut<N> {
         // TODO: fix this in a follow up PR. ideally, consensus engine would be responsible for
         // updating metrics.
         let _ = self.register_metrics(); // ignore error
@@ -248,34 +247,17 @@ where
     /// CAUTION: This method locks the static file producer Mutex, hence can block the thread if the
     /// lock is occupied.
     pub fn move_to_static_files(&self) -> RethResult<()> {
-        let static_file_producer = self.static_file_producer.lock();
-
         // Copies data from database to static files
-        let lowest_static_file_height = {
-            let provider = self.provider_factory.provider()?;
-            let stages_checkpoints = [StageId::Headers, StageId::Execution, StageId::Bodies]
-                .into_iter()
-                .map(|stage| {
-                    provider.get_stage_checkpoint(stage).map(|c| c.map(|c| c.block_number))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let targets = static_file_producer.get_static_file_targets(HighestStaticFiles {
-                headers: stages_checkpoints[0],
-                receipts: stages_checkpoints[1],
-                transactions: stages_checkpoints[2],
-            })?;
-            static_file_producer.run(targets)?;
-            stages_checkpoints.into_iter().min().expect("exists")
-        };
+        let lowest_static_file_height =
+            self.static_file_producer.lock().copy_to_static_files()?.min();
 
         // Deletes data which has been copied to static files.
         if let Some(prune_tip) = lowest_static_file_height {
             // Run the pruner so we don't potentially end up with higher height in the database vs
             // static files during a pipeline unwind
             let mut pruner = PrunerBuilder::new(Default::default())
-                .prune_delete_limit(usize::MAX)
-                .build(self.provider_factory.clone());
+                .delete_limit(usize::MAX)
+                .build_with_provider_factory(self.provider_factory.clone());
 
             pruner.run(prune_tip)?;
         }
@@ -354,18 +336,21 @@ where
                         // update finalized block if needed
                         let last_saved_finalized_block_number =
                             provider_rw.last_finalized_block_number()?;
-                        if checkpoint.block_number < last_saved_finalized_block_number {
+
+                        // If None, that means the finalized block is not written so we should
+                        // always save in that case
+                        if last_saved_finalized_block_number.is_none() ||
+                            Some(checkpoint.block_number) < last_saved_finalized_block_number
+                        {
                             provider_rw.save_finalized_block_number(BlockNumber::from(
                                 checkpoint.block_number,
                             ))?;
                         }
 
-                        // For unwinding it makes more sense to commit the database first, since if
-                        // this function is interrupted before the static files commit, we can just
-                        // truncate the static files according to the
-                        // checkpoints on the next start-up.
-                        provider_rw.commit()?;
-                        self.provider_factory.static_file_provider().commit()?;
+                        UnifiedStorageWriter::commit_unwind(
+                            provider_rw,
+                            self.provider_factory.static_file_provider(),
+                        )?;
 
                         stage.post_unwind_commit()?;
 
@@ -438,6 +423,8 @@ where
                 };
             }
 
+            let provider_rw = self.provider_factory.provider_rw()?;
+
             self.event_sender.notify(PipelineEvent::Run {
                 pipeline_stages_progress: PipelineStagesProgress {
                     current: stage_index + 1,
@@ -448,7 +435,6 @@ where
                 target,
             });
 
-            let provider_rw = self.provider_factory.provider_rw()?;
             match stage.execute(&provider_rw, exec_input) {
                 Ok(out @ ExecOutput { checkpoint, done }) => {
                     made_progress |=
@@ -472,14 +458,10 @@ where
                         result: out.clone(),
                     });
 
-                    // For execution it makes more sense to commit the static files first, since if
-                    // this function is interrupted before the database commit, we can just truncate
-                    // the static files according to the checkpoints on the next
-                    // start-up.
-                    self.provider_factory.static_file_provider().commit()?;
-                    provider_rw.commit()?;
-
-                    stage.post_execute_commit()?;
+                    UnifiedStorageWriter::commit(
+                        provider_rw,
+                        self.provider_factory.static_file_provider(),
+                    )?;
 
                     if done {
                         let block_number = checkpoint.block_number;
@@ -505,8 +487,8 @@ where
     }
 }
 
-fn on_stage_error<DB: Database>(
-    factory: &ProviderFactory<DB>,
+fn on_stage_error<N: ProviderNodeTypes>(
+    factory: &ProviderFactory<N>,
     stage_id: StageId,
     prev_checkpoint: Option<StageCheckpoint>,
     err: StageError,
@@ -537,8 +519,8 @@ fn on_stage_error<DB: Database>(
                     StageId::MerkleExecute,
                     prev_checkpoint.unwrap_or_default(),
                 )?;
-                factory.static_file_provider().commit()?;
-                provider_rw.commit()?;
+
+                UnifiedStorageWriter::commit(provider_rw, factory.static_file_provider())?;
 
                 // We unwind because of a validation error. If the unwind itself
                 // fails, we bail entirely,
@@ -592,7 +574,7 @@ fn on_stage_error<DB: Database>(
     }
 }
 
-impl<DB: Database> std::fmt::Debug for Pipeline<DB> {
+impl<N: NodeTypesWithDB> std::fmt::Debug for Pipeline<N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Pipeline")
             .field("stages", &self.stages.iter().map(|stage| stage.id()).collect::<Vec<StageId>>())
@@ -609,7 +591,7 @@ mod tests {
     use assert_matches::assert_matches;
     use reth_consensus::ConsensusError;
     use reth_errors::ProviderError;
-    use reth_provider::test_utils::create_test_provider_factory;
+    use reth_provider::test_utils::{create_test_provider_factory, MockNodeTypesWithDB};
     use reth_prune::PruneModes;
     use reth_testing_utils::{generators, generators::random_header};
     use tokio_stream::StreamExt;
@@ -646,7 +628,7 @@ mod tests {
     async fn run_pipeline() {
         let provider_factory = create_test_provider_factory();
 
-        let mut pipeline = Pipeline::builder()
+        let mut pipeline = Pipeline::<MockNodeTypesWithDB>::builder()
             .add_stage(
                 TestStage::new(StageId::Other("A"))
                     .add_exec(Ok(ExecOutput { checkpoint: StageCheckpoint::new(20), done: true })),
@@ -714,7 +696,7 @@ mod tests {
     async fn unwind_pipeline() {
         let provider_factory = create_test_provider_factory();
 
-        let mut pipeline = Pipeline::builder()
+        let mut pipeline = Pipeline::<MockNodeTypesWithDB>::builder()
             .add_stage(
                 TestStage::new(StageId::Other("A"))
                     .add_exec(Ok(ExecOutput { checkpoint: StageCheckpoint::new(100), done: true }))
@@ -848,7 +830,7 @@ mod tests {
     async fn unwind_pipeline_with_intermediate_progress() {
         let provider_factory = create_test_provider_factory();
 
-        let mut pipeline = Pipeline::builder()
+        let mut pipeline = Pipeline::<MockNodeTypesWithDB>::builder()
             .add_stage(
                 TestStage::new(StageId::Other("A"))
                     .add_exec(Ok(ExecOutput { checkpoint: StageCheckpoint::new(100), done: true }))
@@ -948,7 +930,7 @@ mod tests {
     async fn run_pipeline_with_unwind() {
         let provider_factory = create_test_provider_factory();
 
-        let mut pipeline = Pipeline::builder()
+        let mut pipeline = Pipeline::<MockNodeTypesWithDB>::builder()
             .add_stage(
                 TestStage::new(StageId::Other("A"))
                     .add_exec(Ok(ExecOutput { checkpoint: StageCheckpoint::new(10), done: true }))
@@ -1069,7 +1051,7 @@ mod tests {
     async fn pipeline_error_handling() {
         // Non-fatal
         let provider_factory = create_test_provider_factory();
-        let mut pipeline = Pipeline::builder()
+        let mut pipeline = Pipeline::<MockNodeTypesWithDB>::builder()
             .add_stage(
                 TestStage::new(StageId::Other("NonFatal"))
                     .add_exec(Err(StageError::Recoverable(Box::new(std::fmt::Error))))
@@ -1085,7 +1067,7 @@ mod tests {
 
         // Fatal
         let provider_factory = create_test_provider_factory();
-        let mut pipeline = Pipeline::builder()
+        let mut pipeline = Pipeline::<MockNodeTypesWithDB>::builder()
             .add_stage(TestStage::new(StageId::Other("Fatal")).add_exec(Err(
                 StageError::DatabaseIntegrity(ProviderError::BlockBodyIndicesNotFound(5)),
             )))

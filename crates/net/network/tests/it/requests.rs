@@ -1,10 +1,14 @@
 #![allow(unreachable_pub)]
 //! Tests for eth related requests
 
+use std::sync::Arc;
+
+use alloy_primitives::{Bytes, TxKind, U256};
 use rand::Rng;
+use reth_eth_wire::HeadersDirection;
 use reth_network::{
     test_utils::{NetworkEventStream, Testnet},
-    NetworkEvents,
+    BlockDownloaderProvider, NetworkEventListenerProvider,
 };
 use reth_network_api::{NetworkInfo, Peers};
 use reth_network_p2p::{
@@ -12,11 +16,9 @@ use reth_network_p2p::{
     headers::client::{HeadersClient, HeadersRequest},
 };
 use reth_primitives::{
-    Block, BlockBody, Bytes, Header, HeadersDirection, Signature, Transaction, TransactionSigned,
-    TxEip2930, TxKind, U256,
+    Block, BlockBody, Header, Signature, Transaction, TransactionSigned, TxEip2930,
 };
 use reth_provider::test_utils::MockEthProvider;
-use std::sync::Arc;
 
 /// Returns a new [`TransactionSigned`] with some random parameters
 pub fn rng_transaction(rng: &mut impl rand::RngCore) -> TransactionSigned {

@@ -106,7 +106,7 @@ impl<DB: Database> Stage<DB> for IndexStorageHistoryStage {
         info!(target: "sync::stages::index_storage_history::exec", ?first_sync, "Collecting indices");
         let collector =
             collect_history_indices::<_, tables::StorageChangeSets, tables::StoragesHistory, _>(
-                provider.tx_ref(),
+                provider,
                 BlockNumberAddress::range(range.clone()),
                 |AddressStorageKey((address, storage_key)), highest_block_number| {
                     StorageShardedKey::new(address, storage_key, highest_block_number)
@@ -117,7 +117,7 @@ impl<DB: Database> Stage<DB> for IndexStorageHistoryStage {
 
         info!(target: "sync::stages::index_storage_history::exec", "Loading indices into database");
         load_history_indices::<_, tables::StoragesHistory, _>(
-            provider.tx_ref(),
+            provider,
             collector,
             first_sync,
             |AddressStorageKey((address, storage_key)), highest_block_number| {
@@ -164,9 +164,9 @@ mod tests {
     };
     use reth_primitives::{address, b256, Address, BlockNumber, StorageEntry, B256, U256};
     use reth_provider::providers::StaticFileWriter;
-    use reth_testing_utils::{
-        generators,
-        generators::{random_block_range, random_changeset_range, random_contract_account_range},
+    use reth_testing_utils::generators::{
+        self, random_block_range, random_changeset_range, random_contract_account_range,
+        BlockRangeParams,
     };
     use std::collections::BTreeMap;
 
@@ -560,7 +560,11 @@ mod tests {
                 .into_iter()
                 .collect::<BTreeMap<_, _>>();
 
-            let blocks = random_block_range(&mut rng, start..=end, B256::ZERO, 0..3);
+            let blocks = random_block_range(
+                &mut rng,
+                start..=end,
+                BlockRangeParams { parent: Some(B256::ZERO), tx_count: 0..3, ..Default::default() },
+            );
 
             let (changesets, _) = random_changeset_range(
                 &mut rng,
@@ -624,7 +628,7 @@ mod tests {
                         .collect::<Vec<Vec<_>>>();
                     let last_chunk = chunks.pop();
 
-                    chunks.into_iter().for_each(|list| {
+                    for list in chunks {
                         result.insert(
                             StorageShardedKey::new(
                                 partial_key.0,
@@ -634,7 +638,7 @@ mod tests {
                             ),
                             list,
                         );
-                    });
+                    }
 
                     if let Some(last_list) = last_chunk {
                         result.insert(

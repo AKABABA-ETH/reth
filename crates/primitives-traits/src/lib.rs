@@ -6,23 +6,25 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-// TODO: remove when https://github.com/proptest-rs/proptest/pull/427 is merged
-#![allow(unknown_lints, non_local_definitions)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
+
+#[macro_use]
+extern crate alloc;
 
 #[cfg(feature = "alloy-compat")]
 mod alloy_compat;
 
 /// Common constants.
 pub mod constants;
+pub use constants::gas_units::{format_gas, format_gas_throughput};
 
 /// Minimal account
 pub mod account;
 pub use account::{Account, Bytecode};
 
 mod integer_list;
-pub use integer_list::IntegerList;
+pub use integer_list::{IntegerList, RoaringBitmapError};
 
 pub mod request;
 pub use request::{Request, Requests};
@@ -43,4 +45,4 @@ pub use storage::StorageEntry;
 pub mod header;
 #[cfg(any(test, feature = "arbitrary", feature = "test-utils"))]
 pub use header::test_utils;
-pub use header::{Header, HeaderError, SealedHeader};
+pub use header::{BlockHeader, Header, HeaderError, SealedHeader};

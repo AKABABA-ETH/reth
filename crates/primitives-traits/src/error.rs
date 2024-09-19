@@ -1,10 +1,8 @@
+use alloc::boxed::Box;
 use core::{
     fmt,
     ops::{Deref, DerefMut},
 };
-
-#[cfg(not(feature = "std"))]
-use alloc::boxed::Box;
 
 /// A pair of values, one of which is expected and one of which is actual.
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

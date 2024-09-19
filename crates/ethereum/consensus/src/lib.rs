@@ -8,7 +8,7 @@
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-use reth_chainspec::{Chain, ChainSpec, Hardfork};
+use reth_chainspec::{ChainSpec, EthereumHardfork, EthereumHardforks};
 use reth_consensus::{Consensus, ConsensusError, PostExecutionInput};
 use reth_consensus_common::validation::{
     validate_4844_header_standalone, validate_against_parent_4844,
@@ -21,6 +21,9 @@ use reth_primitives::{
     EMPTY_OMMER_ROOT_HASH, U256,
 };
 use std::{sync::Arc, time::SystemTime};
+
+/// The bound divisor of the gas limit, used in update calculations.
+const GAS_LIMIT_BOUND_DIVISOR: u64 = 1024;
 
 mod validation;
 pub use validation::validate_block_post_execution;
@@ -43,7 +46,7 @@ impl EthBeaconConsensus {
     /// Checks the gas limit for consistency between parent and self headers.
     ///
     /// The maximum allowable difference between self and parent gas limits is determined by the
-    /// parent's gas limit divided by the elasticity multiplier (1024).
+    /// parent's gas limit divided by the [`GAS_LIMIT_BOUND_DIVISOR`].
     fn validate_against_parent_gas_limit(
         &self,
         header: &SealedHeader,
@@ -51,7 +54,7 @@ impl EthBeaconConsensus {
     ) -> Result<(), ConsensusError> {
         // Determine the parent gas limit, considering elasticity multiplier on the London fork.
         let parent_gas_limit =
-            if self.chain_spec.fork(Hardfork::London).transitions_at_block(header.number) {
+            if self.chain_spec.fork(EthereumHardfork::London).transitions_at_block(header.number) {
                 parent.gas_limit *
                     self.chain_spec
                         .base_fee_params_at_timestamp(header.timestamp)
@@ -62,7 +65,7 @@ impl EthBeaconConsensus {
 
         // Check for an increase in gas limit beyond the allowed threshold.
         if header.gas_limit > parent_gas_limit {
-            if header.gas_limit - parent_gas_limit >= parent_gas_limit / 1024 {
+            if header.gas_limit - parent_gas_limit >= parent_gas_limit / GAS_LIMIT_BOUND_DIVISOR {
                 return Err(ConsensusError::GasLimitInvalidIncrease {
                     parent_gas_limit,
                     child_gas_limit: header.gas_limit,
@@ -70,7 +73,8 @@ impl EthBeaconConsensus {
             }
         }
         // Check for a decrease in gas limit beyond the allowed threshold.
-        else if parent_gas_limit - header.gas_limit >= parent_gas_limit / 1024 {
+        else if parent_gas_limit - header.gas_limit >= parent_gas_limit / GAS_LIMIT_BOUND_DIVISOR
+        {
             return Err(ConsensusError::GasLimitInvalidDecrease {
                 parent_gas_limit,
                 child_gas_limit: header.gas_limit,
@@ -153,7 +157,7 @@ impl Consensus for EthBeaconConsensus {
     ) -> Result<(), ConsensusError> {
         let is_post_merge = self
             .chain_spec
-            .fork(Hardfork::Paris)
+            .fork(EthereumHardfork::Paris)
             .active_at_ttd(total_difficulty, header.difficulty);
 
         if is_post_merge {
@@ -198,12 +202,7 @@ impl Consensus for EthBeaconConsensus {
                 })
             }
 
-            // Goerli and early OP exception:
-            //  * If the network is goerli pre-merge, ignore the extradata check, since we do not
-            //  support clique. Same goes for OP blocks below Bedrock.
-            if self.chain_spec.chain != Chain::goerli() && !self.chain_spec.is_optimism() {
-                validate_header_extradata(header)?;
-            }
+            validate_header_extradata(header)?;
         }
 
         Ok(())
@@ -235,7 +234,7 @@ mod tests {
 
     #[test]
     fn test_valid_gas_limit_increase() {
-        let parent = header_with_gas_limit(1024 * 10);
+        let parent = header_with_gas_limit(GAS_LIMIT_BOUND_DIVISOR * 10);
         let child = header_with_gas_limit(parent.gas_limit + 5);
 
         assert_eq!(
@@ -259,8 +258,10 @@ mod tests {
 
     #[test]
     fn test_invalid_gas_limit_increase_exceeding_limit() {
-        let parent = header_with_gas_limit(1024 * 10);
-        let child = header_with_gas_limit(parent.gas_limit + parent.gas_limit / 1024 + 1);
+        let parent = header_with_gas_limit(GAS_LIMIT_BOUND_DIVISOR * 10);
+        let child = header_with_gas_limit(
+            parent.gas_limit + parent.gas_limit / GAS_LIMIT_BOUND_DIVISOR + 1,
+        );
 
         assert_eq!(
             EthBeaconConsensus::new(Arc::new(ChainSpec::default()))
@@ -274,7 +275,7 @@ mod tests {
 
     #[test]
     fn test_valid_gas_limit_decrease_within_limit() {
-        let parent = header_with_gas_limit(1024 * 10);
+        let parent = header_with_gas_limit(GAS_LIMIT_BOUND_DIVISOR * 10);
         let child = header_with_gas_limit(parent.gas_limit - 5);
 
         assert_eq!(
@@ -286,8 +287,10 @@ mod tests {
 
     #[test]
     fn test_invalid_gas_limit_decrease_exceeding_limit() {
-        let parent = header_with_gas_limit(1024 * 10);
-        let child = header_with_gas_limit(parent.gas_limit - parent.gas_limit / 1024 - 1);
+        let parent = header_with_gas_limit(GAS_LIMIT_BOUND_DIVISOR * 10);
+        let child = header_with_gas_limit(
+            parent.gas_limit - parent.gas_limit / GAS_LIMIT_BOUND_DIVISOR - 1,
+        );
 
         assert_eq!(
             EthBeaconConsensus::new(Arc::new(ChainSpec::default()))

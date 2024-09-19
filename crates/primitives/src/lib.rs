@@ -7,6 +7,8 @@
 //! - `alloy-compat`: Adds compatibility conversions for certain alloy types.
 //! - `arbitrary`: Adds `proptest` and `arbitrary` support for primitive types.
 //! - `test-utils`: Export utilities for testing
+//! - `reth-codec`: Enables db codec support for reth types including zstd compression for certain
+//!   types.
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
@@ -14,28 +16,23 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-// TODO: remove when https://github.com/proptest-rs/proptest/pull/427 is merged
-#![allow(unknown_lints, non_local_definitions)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
-#[cfg(not(feature = "std"))]
 extern crate alloc;
 
 #[cfg(feature = "alloy-compat")]
 mod alloy_compat;
 pub mod basefee;
 mod block;
-#[cfg(feature = "zstd-codec")]
+#[cfg(feature = "reth-codec")]
 mod compression;
 pub mod constants;
 pub mod eip4844;
+pub mod eip7702;
 pub mod genesis;
-pub mod header;
 pub mod proofs;
 mod receipt;
-/// Helpers for working with revm
-pub mod revm;
 pub use reth_static_file_types as static_file;
 pub mod transaction;
 #[cfg(any(test, feature = "arbitrary"))]
@@ -44,26 +41,25 @@ pub use block::{
     Block, BlockBody, BlockHashOrNumber, BlockId, BlockNumHash, BlockNumberOrTag, BlockWithSenders,
     ForkBlock, RpcBlockHash, SealedBlock, SealedBlockWithSenders,
 };
-#[cfg(feature = "zstd-codec")]
+#[cfg(feature = "reth-codec")]
 pub use compression::*;
 pub use constants::{
-    DEV_GENESIS_HASH, EMPTY_OMMER_ROOT_HASH, GOERLI_GENESIS_HASH, HOLESKY_GENESIS_HASH,
-    KECCAK_EMPTY, MAINNET_GENESIS_HASH, SEPOLIA_GENESIS_HASH,
+    DEV_GENESIS_HASH, EMPTY_OMMER_ROOT_HASH, HOLESKY_GENESIS_HASH, KECCAK_EMPTY,
+    MAINNET_GENESIS_HASH, SEPOLIA_GENESIS_HASH,
 };
 pub use genesis::{ChainConfig, Genesis, GenesisAccount};
-pub use header::{Header, HeadersDirection, SealedHeader};
 pub use receipt::{
     gas_spent_by_transactions, Receipt, ReceiptWithBloom, ReceiptWithBloomRef, Receipts,
 };
 pub use reth_primitives_traits::{
-    logs_bloom, Account, Bytecode, GotExpected, GotExpectedBoxed, Log, LogData, Request, Requests,
-    StorageEntry, Withdrawal, Withdrawals,
+    logs_bloom, Account, Bytecode, GotExpected, GotExpectedBoxed, Header, HeaderError, Log,
+    LogData, Request, Requests, SealedHeader, StorageEntry, Withdrawal, Withdrawals,
 };
 pub use static_file::StaticFileSegment;
 
 pub use transaction::{
-    BlobTransaction, BlobTransactionSidecar, FromRecoveredPooledTransaction,
-    PooledTransactionsElement, PooledTransactionsElementEcRecovered,
+    BlobTransaction, BlobTransactionSidecar, PooledTransactionsElement,
+    PooledTransactionsElementEcRecovered,
 };
 
 #[cfg(feature = "c-kzg")]
@@ -73,8 +69,8 @@ pub use transaction::{
     util::secp256k1::{public_key_to_address, recover_signer_unchecked, sign_message},
     AccessList, AccessListItem, IntoRecoveredTransaction, InvalidTransactionError, Signature,
     Transaction, TransactionMeta, TransactionSigned, TransactionSignedEcRecovered,
-    TransactionSignedNoHash, TryFromRecoveredTransaction, TxEip1559, TxEip2930, TxEip4844,
-    TxHashOrNumber, TxLegacy, TxType, EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID, EIP4844_TX_TYPE_ID,
+    TransactionSignedNoHash, TxEip1559, TxEip2930, TxEip4844, TxEip7702, TxHashOrNumber, TxLegacy,
+    TxType, EIP1559_TX_TYPE_ID, EIP2930_TX_TYPE_ID, EIP4844_TX_TYPE_ID, EIP7702_TX_TYPE_ID,
     LEGACY_TX_TYPE_ID,
 };
 
@@ -117,13 +113,7 @@ pub use c_kzg as kzg;
 #[cfg(feature = "optimism")]
 mod optimism {
     pub use crate::transaction::{TxDeposit, DEPOSIT_TX_TYPE_ID};
-    pub use reth_chainspec::{
-        net::{
-            base_nodes, base_testnet_nodes, op_nodes, op_testnet_nodes, OP_BOOTNODES,
-            OP_TESTNET_BOOTNODES,
-        },
-        BASE_MAINNET, BASE_SEPOLIA, OP_MAINNET, OP_SEPOLIA,
-    };
+    pub use reth_optimism_chainspec::{BASE_MAINNET, BASE_SEPOLIA, OP_MAINNET, OP_SEPOLIA};
 }
 
 #[cfg(feature = "optimism")]
