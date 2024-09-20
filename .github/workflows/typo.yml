@@ -1,0 +1,69 @@
+name: Comprehensive Workflow
+
+on:
+  push:
+    branches:
+      - main
+      - release/*
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "0 2 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  check_typo_and_deploy:
+    name: Check Typos and Deploy
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Typos Check
+        uses: crate-ci/typos@v1.20.1
+        with:
+          # Add or remove specific files or patterns as needed
+          files: "*.md,*.txt"
+          # Custom identifiers, such as names that shouldn't be considered typos
+          extend_identifiers: "GitHub, Actions"
+          # Custom words to add to the dictionary
+          extend_words: "Nodejs, YAML"
+          # Avoid using implicit configuration files
+          isolated: true
+          # Whether to automatically correct typos
+          write_changes: true
+          # Path to a custom configuration file if you have one
+          config: ".typosconfig.toml"
+
+      - name: Build Project
+        run: npm run build
+
+      - name: Deploy to Staging
+        run: echo "Deploying to staging server"
+
+      - name: Test on node and OS matrix
+        name: Test on node ${{ matrix.node_version }} and ${{ matrix.os }}
+        runs-on: ${{ matrix.os }}
+        strategy:
+          matrix:
+            node_version: ['18.x', '20.x']
+            os: [ubuntu-latest, windows-latest, macos-latest]
+        steps:
+          - uses: actions/checkout@v4
+          - name: Use Node.js ${{ matrix.node_version }}
+            uses: actions/setup-node@v4
+            with:
+              node-version: ${{ matrix.node_version }}
+          - run: |
+              npm install
+              npm run build --if-present
+              npm test
