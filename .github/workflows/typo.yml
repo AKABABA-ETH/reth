@@ -1,7 +1,6 @@
 name: Comprehensive Workflow
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
@@ -11,6 +10,7 @@ on:
       - main
   schedule:
     - cron: "0 2 * * 1-5"
+  workflow_dispatch:
 
 jobs:
   check_typo_and_deploy:
@@ -50,20 +50,19 @@ jobs:
       - name: Deploy to Staging
         run: echo "Deploying to staging server"
 
-      - name: Test on node and OS matrix
-        name: Test on node ${{ matrix.node_version }} and ${{ matrix.os }}
-        runs-on: ${{ matrix.os }}
-        strategy:
-          matrix:
-            node_version: ['18.x', '20.x']
-            os: [ubuntu-latest, windows-latest, macos-latest]
-        steps:
-          - uses: actions/checkout@v4
-          - name: Use Node.js ${{ matrix.node_version }}
-            uses: actions/setup-node@v4
-            with:
-              node-version: ${{ matrix.node_version }}
-          - run: |
-              npm install
-              npm run build --if-present
-              npm test
+  test_matrix:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        node_version: ['18.x', '20.x']
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js ${{ matrix.node_version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node_version }}
+      - run: |
+          npm install
+          npm run build --if-present
+          npm test
