@@ -1,9 +1,20 @@
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
-use alloy_primitives::{Bytes, B256, U256};
+use alloy_primitives::{map::HashSet, Bytes, B256, U256};
+use alloy_rpc_types::{
+    state::{EvmOverrides, StateOverride},
+    BlockOverrides, Index,
+};
+use alloy_rpc_types_eth::transaction::TransactionRequest;
+use alloy_rpc_types_trace::{
+    filter::TraceFilter,
+    opcode::{BlockOpcodeGas, TransactionOpcodeGas},
+    parity::*,
+    tracerequest::TraceCallRequest,
+};
 use async_trait::async_trait;
 use jsonrpsee::core::RpcResult;
-use reth_chainspec::{ChainSpec, EthereumHardforks};
+use reth_chainspec::EthereumHardforks;
 use reth_consensus_common::calc::{
     base_block_reward, base_block_reward_pre_merge, block_reward, ommer_reward,
 };
@@ -17,16 +28,6 @@ use reth_rpc_eth_api::{
     FromEthApiError,
 };
 use reth_rpc_eth_types::{error::EthApiError, utils::recover_raw_transaction};
-use reth_rpc_types::{
-    state::{EvmOverrides, StateOverride},
-    trace::{
-        filter::TraceFilter,
-        opcode::{BlockOpcodeGas, TransactionOpcodeGas},
-        parity::*,
-        tracerequest::TraceCallRequest,
-    },
-    BlockOverrides, Index, TransactionRequest,
-};
 use reth_tasks::pool::BlockingTaskGuard;
 use revm::{
     db::{CacheDB, DatabaseCommit},
@@ -79,7 +80,7 @@ where
     Provider: BlockReader
         + StateProviderFactory
         + EvmEnvProvider
-        + ChainSpecProvider<ChainSpec = ChainSpec>
+        + ChainSpecProvider<ChainSpec: EthereumHardforks>
         + 'static,
     Eth: TraceExt + 'static,
 {
@@ -152,7 +153,6 @@ where
         let at = block_id.unwrap_or(BlockId::pending());
         let (cfg, block_env, at) = self.inner.eth_api.evm_env_at(at).await?;
 
-        let gas_limit = self.inner.eth_api.call_gas_limit();
         let this = self.clone();
         // execute all transactions on top of each other and record the traces
         self.eth_api()
@@ -167,7 +167,6 @@ where
                         cfg.clone(),
                         block_env.clone(),
                         call,
-                        gas_limit,
                         &mut db,
                         Default::default(),
                     )?;
@@ -310,8 +309,11 @@ where
         // add reward traces for all blocks
         for block in &blocks {
             if let Some(base_block_reward) = self.calculate_base_block_reward(&block.header)? {
-                let mut traces =
-                    self.extract_reward_traces(&block.header, &block.ommers, base_block_reward);
+                let mut traces = self.extract_reward_traces(
+                    &block.header,
+                    &block.body.ommers,
+                    base_block_reward,
+                );
                 traces.retain(|trace| matcher.matches(&trace.trace));
                 all_traces.extend(traces);
             } else {
@@ -382,7 +384,7 @@ where
             if let Some(base_block_reward) = self.calculate_base_block_reward(&block.header)? {
                 traces.extend(self.extract_reward_traces(
                     &block.header,
-                    &block.ommers,
+                    &block.body.ommers,
                     base_block_reward,
                 ));
             }
@@ -555,7 +557,7 @@ where
     Provider: BlockReader
         + StateProviderFactory
         + EvmEnvProvider
-        + ChainSpecProvider<ChainSpec = ChainSpec>
+        + ChainSpecProvider<ChainSpec: EthereumHardforks>
         + 'static,
     Eth: TraceExt + 'static,
 {

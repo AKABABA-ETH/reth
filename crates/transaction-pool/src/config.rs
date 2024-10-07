@@ -157,7 +157,7 @@ pub struct LocalTransactionConfig {
     ///   - no price exemptions
     ///   - no eviction exemptions
     pub no_exemptions: bool,
-    /// Addresses that will be considered as local . Above exemptions apply
+    /// Addresses that will be considered as local. Above exemptions apply.
     pub local_addresses: HashSet<Address>,
     /// Flag indicating whether local transactions should be propagated.
     pub propagate_local_transactions: bool,
@@ -266,7 +266,7 @@ mod tests {
     #[test]
     fn test_contains_local_address() {
         let address = Address::new([1; 20]);
-        let mut local_addresses = HashSet::new();
+        let mut local_addresses = HashSet::default();
         local_addresses.insert(address);
 
         let config = LocalTransactionConfig { local_addresses, ..Default::default() };
@@ -283,7 +283,7 @@ mod tests {
         let address = Address::new([1; 20]);
         let config = LocalTransactionConfig {
             no_exemptions: true,
-            local_addresses: HashSet::new(),
+            local_addresses: HashSet::default(),
             ..Default::default()
         };
 
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn test_is_local_without_no_exemptions() {
         let address = Address::new([1; 20]);
-        let mut local_addresses = HashSet::new();
+        let mut local_addresses = HashSet::default();
         local_addresses.insert(address);
 
         let config =

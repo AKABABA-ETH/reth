@@ -324,6 +324,7 @@ where
 impl<V, T, S> TransactionPool for Pool<V, T, S>
 where
     V: TransactionValidator,
+    <V as TransactionValidator>::Transaction: EthPoolTransaction,
     T: TransactionOrdering<Transaction = <V as TransactionValidator>::Transaction>,
     S: BlobStore,
 {
@@ -505,6 +506,14 @@ where
         self.pool.get_transactions_by_origin(origin)
     }
 
+    /// Returns all pending transactions filtered by [`TransactionOrigin`]
+    fn get_pending_transactions_by_origin(
+        &self,
+        origin: TransactionOrigin,
+    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
+        self.pool.get_pending_transactions_by_origin(origin)
+    }
+
     fn unique_senders(&self) -> HashSet<Address> {
         self.pool.unique_senders()
     }
@@ -533,19 +542,12 @@ where
     ) -> Result<Vec<Option<BlobAndProofV1>>, BlobStoreError> {
         self.pool.blob_store().get_by_versioned_hashes(versioned_hashes)
     }
-
-    /// Returns all pending transactions filtered by [`TransactionOrigin`]
-    fn get_pending_transactions_by_origin(
-        &self,
-        origin: TransactionOrigin,
-    ) -> Vec<Arc<ValidPoolTransaction<Self::Transaction>>> {
-        self.pool.get_pending_transactions_by_origin(origin)
-    }
 }
 
 impl<V, T, S> TransactionPoolExt for Pool<V, T, S>
 where
     V: TransactionValidator,
+    <V as TransactionValidator>::Transaction: EthPoolTransaction,
     T: TransactionOrdering<Transaction = <V as TransactionValidator>::Transaction>,
     S: BlobStore,
 {
