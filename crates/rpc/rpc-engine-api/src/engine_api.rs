@@ -281,7 +281,7 @@ where
     pub async fn get_payload_v1(
         &self,
         payload_id: PayloadId,
-    ) -> EngineApiResult<EngineT::ExecutionPayloadV1> {
+    ) -> EngineApiResult<EngineT::ExecutionPayloadEnvelopeV1> {
         self.inner
             .payload_store
             .resolve(payload_id)
@@ -616,7 +616,8 @@ where
             // To do this, we set the payload attrs to `None` if attribute validation failed, but
             // we still apply the forkchoice update.
             if let Err(err) = attr_validation_res {
-                let fcu_res = self.inner.beacon_consensus.fork_choice_updated(state, None).await?;
+                let fcu_res =
+                    self.inner.beacon_consensus.fork_choice_updated(state, None, version).await?;
                 // TODO: decide if we want this branch - the FCU INVALID response might be more
                 // useful than the payload attributes INVALID response
                 if fcu_res.is_invalid() {
@@ -626,7 +627,7 @@ where
             }
         }
 
-        Ok(self.inner.beacon_consensus.fork_choice_updated(state, payload_attrs).await?)
+        Ok(self.inner.beacon_consensus.fork_choice_updated(state, payload_attrs, version).await?)
     }
 }
 
@@ -774,7 +775,7 @@ where
     async fn get_payload_v1(
         &self,
         payload_id: PayloadId,
-    ) -> RpcResult<EngineT::ExecutionPayloadV1> {
+    ) -> RpcResult<EngineT::ExecutionPayloadEnvelopeV1> {
         trace!(target: "rpc::engine", "Serving engine_getPayloadV1");
         let start = Instant::now();
         let res = Self::get_payload_v1(self, payload_id).await;
