@@ -1,13 +1,10 @@
-use std::{
-    net::SocketAddr,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc,
-    },
+use crate::{
+    config::NetworkMode, message::PeerMessage, protocol::RlpxSubProtocol,
+    swarm::NetworkConnectionState, transactions::TransactionsHandle, FetchClient,
 };
-
 use alloy_primitives::B256;
 use enr::Enr;
+use futures::StreamExt;
 use parking_lot::Mutex;
 use reth_discv4::{Discv4, NatResolver};
 use reth_discv5::Discv5;
@@ -15,7 +12,9 @@ use reth_eth_wire::{
     DisconnectReason, EthNetworkPrimitives, NetworkPrimitives, NewBlock,
     NewPooledTransactionHashes, SharedTransactions,
 };
+use reth_ethereum_forks::Head;
 use reth_network_api::{
+    events::{NetworkPeersEvents, PeerEvent, PeerEventStream},
     test_utils::{PeersHandle, PeersHandleProvider},
     BlockDownloaderProvider, DiscoveryEvent, NetworkError, NetworkEvent,
     NetworkEventListenerProvider, NetworkInfo, NetworkStatus, PeerInfo, PeerRequest, Peers,
@@ -24,19 +23,20 @@ use reth_network_api::{
 use reth_network_p2p::sync::{NetworkSyncUpdater, SyncState, SyncStateProvider};
 use reth_network_peers::{NodeRecord, PeerId};
 use reth_network_types::{PeerAddr, PeerKind, Reputation, ReputationChangeKind};
-use reth_primitives::{Head, TransactionSigned};
 use reth_tokio_util::{EventSender, EventStream};
 use secp256k1::SecretKey;
+use std::{
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
+};
 use tokio::sync::{
     mpsc::{self, UnboundedSender},
     oneshot,
 };
 use tokio_stream::wrappers::UnboundedReceiverStream;
-
-use crate::{
-    config::NetworkMode, protocol::RlpxSubProtocol, swarm::NetworkConnectionState,
-    transactions::TransactionsHandle, FetchClient,
-};
 
 /// A _shareable_ network frontend. Used to interact with the network.
 ///
@@ -131,17 +131,22 @@ impl<N: NetworkPrimitives> NetworkHandle<N> {
     }
 
     /// Send full transactions to the peer
-    pub fn send_transactions(&self, peer_id: PeerId, msg: Vec<Arc<TransactionSigned>>) {
+    pub fn send_transactions(&self, peer_id: PeerId, msg: Vec<Arc<N::BroadcastedTransaction>>) {
         self.send_message(NetworkHandleMessage::SendTransaction {
             peer_id,
             msg: SharedTransactions(msg),
         })
     }
 
+    /// Send eth message to the peer.
+    pub fn send_eth_message(&self, peer_id: PeerId, message: PeerMessage<N>) {
+        self.send_message(NetworkHandleMessage::EthMessage { peer_id, message })
+    }
+
     /// Send message to get the [`TransactionsHandle`].
     ///
     /// Returns `None` if no transaction task is installed.
-    pub async fn transactions_handle(&self) -> Option<TransactionsHandle> {
+    pub async fn transactions_handle(&self) -> Option<TransactionsHandle<N>> {
         let (tx, rx) = oneshot::channel();
         let _ = self.manager().send(NetworkHandleMessage::GetTransactionsHandle(tx));
         rx.await.unwrap()
@@ -189,8 +194,21 @@ impl<N: NetworkPrimitives> NetworkHandle<N> {
 
 // === API Implementations ===
 
-impl NetworkEventListenerProvider for NetworkHandle<EthNetworkPrimitives> {
-    fn event_listener(&self) -> EventStream<NetworkEvent<PeerRequest<EthNetworkPrimitives>>> {
+impl<N: NetworkPrimitives> NetworkPeersEvents for NetworkHandle<N> {
+    /// Returns an event stream of peer-specific network events.
+    fn peer_events(&self) -> PeerEventStream {
+        let peer_events = self.inner.event_sender.new_listener().map(|event| match event {
+            NetworkEvent::Peer(peer_event) => peer_event,
+            NetworkEvent::ActivePeerSession { info, .. } => PeerEvent::SessionEstablished(info),
+        });
+        PeerEventStream::new(peer_events)
+    }
+}
+
+impl<N: NetworkPrimitives> NetworkEventListenerProvider for NetworkHandle<N> {
+    type Primitives = N;
+
+    fn event_listener(&self) -> EventStream<NetworkEvent<PeerRequest<Self::Primitives>>> {
         self.inner.event_sender.new_listener()
     }
 
@@ -252,7 +270,7 @@ impl<N: NetworkPrimitives> PeersInfo for NetworkHandle<N> {
     }
 }
 
-impl Peers for NetworkHandle {
+impl<N: NetworkPrimitives> Peers for NetworkHandle<N> {
     fn add_trusted_peer_id(&self, peer: PeerId) {
         self.send_message(NetworkHandleMessage::AddTrustedPeerId(peer));
     }
@@ -467,7 +485,7 @@ pub(crate) enum NetworkHandleMessage<N: NetworkPrimitives = EthNetworkPrimitives
         /// The ID of the peer to which the transactions are sent.
         peer_id: PeerId,
         /// The shared transactions to send.
-        msg: SharedTransactions,
+        msg: SharedTransactions<N::BroadcastedTransaction>,
     },
     /// Sends a list of transaction hashes to the given peer.
     SendPooledTransactionHashes {
@@ -482,6 +500,13 @@ pub(crate) enum NetworkHandleMessage<N: NetworkPrimitives = EthNetworkPrimitives
         peer_id: PeerId,
         /// The request to send to the peer's sessions.
         request: PeerRequest<N>,
+    },
+    /// Sends an `eth` protocol message to the peer.
+    EthMessage {
+        /// The peer to send the message to.
+        peer_id: PeerId,
+        /// The message to send to the peer's sessions.
+        message: PeerMessage<N>,
     },
     /// Applies a reputation change to the given peer.
     ReputationChange(PeerId, ReputationChangeKind),
@@ -505,7 +530,7 @@ pub(crate) enum NetworkHandleMessage<N: NetworkPrimitives = EthNetworkPrimitives
     /// Gets the reputation for a specific peer via a oneshot sender.
     GetReputationById(PeerId, oneshot::Sender<Option<Reputation>>),
     /// Retrieves the `TransactionsHandle` via a oneshot sender.
-    GetTransactionsHandle(oneshot::Sender<Option<TransactionsHandle>>),
+    GetTransactionsHandle(oneshot::Sender<Option<TransactionsHandle<N>>>),
     /// Initiates a graceful shutdown of the network via a oneshot sender.
     Shutdown(oneshot::Sender<()>),
     /// Sets the network state between hibernation and active.

@@ -22,8 +22,7 @@ use reth_db::{
 };
 use reth_fs_util as fs;
 use reth_primitives::{
-    Account, Log, LogData, Receipt, ReceiptWithBloom, StorageEntry, Transaction,
-    TransactionSignedNoHash, TxType,
+    Account, Log, LogData, Receipt, StorageEntry, Transaction, TransactionSigned, TxType,
 };
 use reth_prune_types::{PruneCheckpoint, PruneMode};
 use reth_stages_types::{
@@ -76,7 +75,6 @@ compact_types!(
         // reth-primitives
         Account,
         Receipt,
-        ReceiptWithBloom,
         // reth_codecs::alloy
         Authorization,
         GenesisAccount,
@@ -113,7 +111,7 @@ compact_types!(
         StoredBlockBodyIndices,
         StoredBlockWithdrawals,
         // Manual implementations
-        TransactionSignedNoHash,
+        TransactionSigned,
         // Bytecode, // todo revm arbitrary
         StorageEntry,
         // MerkleCheckpoint, // todo storedsubnode -> branchnodecompact arbitrary
@@ -271,7 +269,7 @@ where
 
         let (reconstructed, _) = T::from_compact(&compact_bytes, len_or_identifier);
         reconstructed.to_compact(&mut buffer);
-        assert_eq!(buffer, compact_bytes);
+        assert_eq!(buffer, compact_bytes, "mismatch {}", type_name);
     }
 
     println!(" ✅");

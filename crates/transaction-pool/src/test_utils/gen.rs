@@ -4,7 +4,8 @@ use alloy_eips::{eip1559::MIN_PROTOCOL_BASE_FEE, eip2718::Encodable2718, eip2930
 use alloy_primitives::{Address, Bytes, TxKind, B256, U256};
 use rand::Rng;
 use reth_chainspec::MAINNET;
-use reth_primitives::{sign_message, Transaction, TransactionSigned};
+use reth_primitives::{Transaction, TransactionSigned};
+use reth_primitives_traits::crypto::secp256k1::sign_message;
 
 /// A generator for transactions for testing purposes.
 #[derive(Debug)]
@@ -199,7 +200,7 @@ impl TransactionBuilder {
     /// Signs the provided transaction using the specified signer and returns a signed transaction.
     fn signed(transaction: Transaction, signer: B256) -> TransactionSigned {
         let signature = sign_message(signer, transaction.signature_hash()).unwrap();
-        TransactionSigned::from_transaction_and_signature(transaction, signature)
+        TransactionSigned::new_unhashed(transaction, signature)
     }
 
     /// Sets the signer for the transaction builder.

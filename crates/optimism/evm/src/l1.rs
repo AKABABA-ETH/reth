@@ -2,12 +2,13 @@
 
 use crate::OpBlockExecutionError;
 use alloc::{string::ToString, sync::Arc};
+use alloy_consensus::Transaction;
 use alloy_primitives::{address, b256, hex, Address, Bytes, B256, U256};
 use reth_chainspec::ChainSpec;
 use reth_execution_errors::BlockExecutionError;
 use reth_optimism_chainspec::OpChainSpec;
 use reth_optimism_forks::OpHardfork;
-use reth_primitives::BlockBody;
+use reth_primitives_traits::BlockBody;
 use revm::{
     primitives::{Bytecode, HashMap, SpecId},
     DatabaseCommit, L1BlockInfo,
@@ -31,15 +32,22 @@ const L1_BLOCK_ECOTONE_SELECTOR: [u8; 4] = hex!("440a5e20");
 /// transaction in the L2 block.
 ///
 /// Returns an error if the L1 info transaction is not found, if the block is empty.
-pub fn extract_l1_info(body: &BlockBody) -> Result<L1BlockInfo, OpBlockExecutionError> {
-    let l1_info_tx_data = body
-        .transactions
-        .first()
-        .ok_or_else(|| OpBlockExecutionError::L1BlockInfoError {
+pub fn extract_l1_info<B: BlockBody>(body: &B) -> Result<L1BlockInfo, OpBlockExecutionError> {
+    let l1_info_tx =
+        body.transactions().first().ok_or_else(|| OpBlockExecutionError::L1BlockInfoError {
             message: "could not find l1 block info tx in the L2 block".to_string(),
-        })
-        .map(|tx| tx.input())?;
+        })?;
+    extract_l1_info_from_tx(l1_info_tx)
+}
 
+/// Extracts the [`L1BlockInfo`] from the the L1 info transaction (first transaction) in the L2
+/// block.
+///
+/// Returns an error if the calldata is shorter than 4 bytes.
+pub fn extract_l1_info_from_tx<T: Transaction>(
+    tx: &T,
+) -> Result<L1BlockInfo, OpBlockExecutionError> {
+    let l1_info_tx_data = tx.input();
     if l1_info_tx_data.len() < 4 {
         return Err(OpBlockExecutionError::L1BlockInfoError {
             message: "invalid l1 block info transaction calldata in the L2 block".to_string(),
@@ -52,6 +60,12 @@ pub fn extract_l1_info(body: &BlockBody) -> Result<L1BlockInfo, OpBlockExecution
 /// Parses the input of the first transaction in the L2 block, into [`L1BlockInfo`].
 ///
 /// Returns an error if data is incorrect length.
+///
+/// Caution this expects that the input is the calldata of the [`L1BlockInfo`] transaction (first
+/// transaction) in the L2 block.
+///
+/// # Panics
+/// If the input is shorter than 4 bytes.
 pub fn parse_l1_info(input: &[u8]) -> Result<L1BlockInfo, OpBlockExecutionError> {
     // If the first 4 bytes of the calldata are the L1BlockInfoEcotone selector, then we parse the
     // calldata as an Ecotone hardfork L1BlockInfo transaction. Otherwise, we parse it as a
@@ -182,7 +196,7 @@ pub trait RethL1BlockInfo {
     /// - `input`: The calldata of the transaction.
     /// - `is_deposit`: Whether or not the transaction is a deposit.
     fn l1_tx_data_fee(
-        &self,
+        &mut self,
         chain_spec: &ChainSpec,
         timestamp: u64,
         input: &[u8],
@@ -205,7 +219,7 @@ pub trait RethL1BlockInfo {
 
 impl RethL1BlockInfo for L1BlockInfo {
     fn l1_tx_data_fee(
-        &self,
+        &mut self,
         chain_spec: &ChainSpec,
         timestamp: u64,
         input: &[u8],

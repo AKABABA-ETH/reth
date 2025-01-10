@@ -1,7 +1,11 @@
 //! Network config support
 
-use std::{collections::HashSet, net::SocketAddr, sync::Arc};
-
+use crate::{
+    error::NetworkError,
+    import::{BlockImport, ProofOfStakeBlockImport},
+    transactions::TransactionsManagerConfig,
+    NetworkHandle, NetworkManager,
+};
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, Hardforks};
 use reth_discv4::{Discv4Config, Discv4ConfigBuilder, NatResolver, DEFAULT_DISCOVERY_ADDRESS};
 use reth_discv5::NetworkStackId;
@@ -9,19 +13,13 @@ use reth_dns_discovery::DnsDiscoveryConfig;
 use reth_eth_wire::{
     EthNetworkPrimitives, HelloMessage, HelloMessageWithProtocols, NetworkPrimitives, Status,
 };
+use reth_ethereum_forks::{ForkFilter, Head};
 use reth_network_peers::{mainnet_nodes, pk2id, sepolia_nodes, PeerId, TrustedPeer};
 use reth_network_types::{PeersConfig, SessionsConfig};
-use reth_primitives::{ForkFilter, Head};
-use reth_storage_api::{noop::NoopBlockReader, BlockNumReader, BlockReader, HeaderProvider};
+use reth_storage_api::{noop::NoopProvider, BlockNumReader, BlockReader, HeaderProvider};
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use secp256k1::SECP256K1;
-
-use crate::{
-    error::NetworkError,
-    import::{BlockImport, ProofOfStakeBlockImport},
-    transactions::TransactionsManagerConfig,
-    NetworkHandle, NetworkManager,
-};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 // re-export for convenience
 use crate::protocol::{IntoRlpxSubProtocol, RlpxSubProtocols};
@@ -96,7 +94,7 @@ impl<N: NetworkPrimitives> NetworkConfig<(), N> {
     }
 
     /// Convenience method for creating the corresponding builder type with a random secret key.
-    pub fn builder_with_rng_secret_key() -> NetworkConfigBuilder {
+    pub fn builder_with_rng_secret_key() -> NetworkConfigBuilder<N> {
         NetworkConfigBuilder::with_rng_secret_key()
     }
 }
@@ -147,12 +145,17 @@ where
     }
 }
 
-impl<C> NetworkConfig<C>
+impl<C, N> NetworkConfig<C, N>
 where
-    C: BlockReader + HeaderProvider + Clone + Unpin + 'static,
+    N: NetworkPrimitives,
+    C: BlockReader<Block = N::Block, Receipt = N::Receipt, Header = N::BlockHeader>
+        + HeaderProvider
+        + Clone
+        + Unpin
+        + 'static,
 {
     /// Starts the networking stack given a [`NetworkConfig`] and returns a handle to the network.
-    pub async fn start_network(self) -> Result<NetworkHandle, NetworkError> {
+    pub async fn start_network(self) -> Result<NetworkHandle<N>, NetworkError> {
         let client = self.client.clone();
         let (handle, network, _txpool, eth) = NetworkManager::builder::<C>(self)
             .await?
@@ -261,6 +264,17 @@ impl<N: NetworkPrimitives> NetworkConfigBuilder<N> {
     pub const fn network_mode(mut self, network_mode: NetworkMode) -> Self {
         self.network_mode = network_mode;
         self
+    }
+
+    /// Configures the network to use proof-of-work.
+    ///
+    /// This effectively allows block propagation in the `eth` sub-protocol, which has been
+    /// soft-deprecated with ethereum `PoS` after the merge. Even if block propagation is
+    /// technically allowed, according to the eth protocol, it is not expected to be used in `PoS`
+    /// networks and peers are supposed to terminate the connection if they receive a `NewBlock`
+    /// message.
+    pub const fn with_pow(self) -> Self {
+        self.network_mode(NetworkMode::Work)
     }
 
     /// Sets the highest synced block.
@@ -493,11 +507,11 @@ impl<N: NetworkPrimitives> NetworkConfigBuilder<N> {
     pub fn build_with_noop_provider<ChainSpec>(
         self,
         chain_spec: Arc<ChainSpec>,
-    ) -> NetworkConfig<NoopBlockReader<ChainSpec>, N>
+    ) -> NetworkConfig<NoopProvider<ChainSpec>, N>
     where
         ChainSpec: EthChainSpec + Hardforks + 'static,
     {
-        self.build(NoopBlockReader::new(chain_spec))
+        self.build(NoopProvider::eth(chain_spec))
     }
 
     /// Sets the NAT resolver for external IP.
@@ -639,7 +653,7 @@ mod tests {
     use reth_chainspec::{Chain, MAINNET};
     use reth_dns_discovery::tree::LinkEntry;
     use reth_primitives::ForkHash;
-    use reth_provider::test_utils::NoopProvider;
+    use reth_storage_api::noop::NoopProvider;
     use std::sync::Arc;
 
     fn builder() -> NetworkConfigBuilder {

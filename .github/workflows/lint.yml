@@ -71,9 +71,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - uses: dcarbone/install-jq-action@v2
+      - uses: dcarbone/install-jq-action@v3
       - name: Run Wasm checks
-        run: .github/assets/check_wasm.sh
+        run: |
+          sudo apt update && sudo apt install gcc-multilib
+          .github/assets/check_wasm.sh
+
+  riscv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          target: riscv32imac-unknown-none-elf
+      - uses: taiki-e/install-action@cargo-hack
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      - uses: dcarbone/install-jq-action@v3
+      - name: Run RISC-V checks
+        run: .github/assets/check_rv32imac.sh
 
   crate-checks:
     runs-on: ubuntu-latest
@@ -235,6 +253,9 @@ jobs:
           zepter --version
           time zepter run check
 
+  deny:
+    uses: ithacaxyz/ci/.github/workflows/deny.yml@main
+
   lint-success:
     name: lint success
     runs-on: ubuntu-latest
@@ -253,6 +274,7 @@ jobs:
       - no-test-deps
       - features
       - feature-propagation
+      - deny
     timeout-minutes: 30
     steps:
       - name: Decide whether the needed jobs succeeded or failed

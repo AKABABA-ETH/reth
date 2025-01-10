@@ -1,3 +1,4 @@
+use alloy_consensus::BlockHeader;
 use alloy_primitives::{BlockNumber, B256};
 use reth_codecs::Compact;
 use reth_consensus::ConsensusError;
@@ -168,7 +169,7 @@ where
         let target_block = provider
             .header_by_number(to_block)?
             .ok_or_else(|| ProviderError::HeaderNotFound(to_block.into()))?;
-        let target_block_root = target_block.state_root;
+        let target_block_root = target_block.state_root();
 
         let mut checkpoint = self.get_execution_checkpoint(provider)?;
         let (trie_root, entities_checkpoint) = if range.is_empty() {
@@ -343,20 +344,20 @@ where
 
 /// Check that the computed state root matches the root in the expected header.
 #[inline]
-fn validate_state_root(
+fn validate_state_root<H: BlockHeader + Debug>(
     got: B256,
-    expected: SealedHeader,
+    expected: SealedHeader<H>,
     target_block: BlockNumber,
 ) -> Result<(), StageError> {
-    if got == expected.state_root {
+    if got == expected.state_root() {
         Ok(())
     } else {
         error!(target: "sync::stages::merkle", ?target_block, ?got, ?expected, "Failed to verify block state root! {INVALID_STATE_ROOT_ERROR_MESSAGE}");
         Err(StageError::Block {
             error: BlockErrorKind::Validation(ConsensusError::BodyStateRootDiff(
-                GotExpected { got, expected: expected.state_root }.into(),
+                GotExpected { got, expected: expected.state_root() }.into(),
             )),
-            block: Box::new(expected),
+            block: Box::new(expected.block_with_parent()),
         })
     }
 }
@@ -519,11 +520,12 @@ mod tests {
                 accounts.iter().map(|(addr, acc)| (*addr, (*acc, std::iter::empty()))),
             )?;
 
-            let SealedBlock { header, body } = random_block(
+            let (header, body) = random_block(
                 &mut rng,
                 stage_progress,
                 BlockParams { parent: preblocks.last().map(|b| b.hash()), ..Default::default() },
-            );
+            )
+            .split();
             let mut header = header.unseal();
 
             header.state_root = state_root(
@@ -532,7 +534,7 @@ mod tests {
                     .into_iter()
                     .map(|(address, account)| (address, (account, std::iter::empty()))),
             );
-            let sealed_head = SealedBlock { header: SealedHeader::seal(header), body };
+            let sealed_head = SealedBlock::new(SealedHeader::seal(header), body);
 
             let head_hash = sealed_head.hash();
             let mut blocks = vec![sealed_head];
@@ -646,7 +648,7 @@ mod tests {
 
                             if !value.is_zero() {
                                 let storage_entry = StorageEntry { key: hashed_slot, value };
-                                storage_cursor.upsert(hashed_address, storage_entry).unwrap();
+                                storage_cursor.upsert(hashed_address, &storage_entry).unwrap();
                             }
                         }
                     }

@@ -1,30 +1,30 @@
 use crate::{
     capabilities::EngineCapabilities, metrics::EngineApiMetrics, EngineApiError, EngineApiResult,
 };
-use alloy_eips::{eip1898::BlockHashOrNumber, eip4844::BlobAndProofV1, eip7685::Requests};
+use alloy_eips::{
+    eip1898::BlockHashOrNumber,
+    eip4844::BlobAndProofV1,
+    eip7685::{Requests, RequestsOrHash},
+};
 use alloy_primitives::{BlockHash, BlockNumber, B256, U64};
 use alloy_rpc_types_engine::{
     CancunPayloadFields, ClientVersionV1, ExecutionPayload, ExecutionPayloadBodiesV1,
     ExecutionPayloadInputV2, ExecutionPayloadSidecar, ExecutionPayloadV1, ExecutionPayloadV3,
-    ForkchoiceState, ForkchoiceUpdated, PayloadId, PayloadStatus, TransitionConfiguration,
+    ForkchoiceState, ForkchoiceUpdated, PayloadId, PayloadStatus, PraguePayloadFields,
+    TransitionConfiguration,
 };
 use async_trait::async_trait;
 use jsonrpsee_core::RpcResult;
 use parking_lot::Mutex;
-use reth_beacon_consensus::BeaconConsensusEngineHandle;
-use reth_chainspec::{EthereumHardforks, Hardforks};
-use reth_engine_primitives::{EngineTypes, EngineValidator};
-use reth_evm::provider::EvmEnvProvider;
+use reth_chainspec::{EthereumHardfork, EthereumHardforks};
+use reth_engine_primitives::{BeaconConsensusEngineHandle, EngineTypes, EngineValidator};
 use reth_payload_builder::PayloadStore;
 use reth_payload_primitives::{
     validate_payload_timestamp, EngineApiMessageVersion, PayloadBuilderAttributes,
     PayloadOrAttributes,
 };
-use reth_primitives::{Block, EthereumHardfork};
 use reth_rpc_api::EngineApiServer;
-use reth_rpc_types_compat::engine::payload::{
-    convert_payload_input_v2_to_payload, convert_to_payload_body_v1,
-};
+use reth_rpc_types_compat::engine::payload::convert_to_payload_body_v1;
 use reth_storage_api::{BlockReader, HeaderProvider, StateProviderFactory};
 use reth_tasks::TaskSpawner;
 use reth_transaction_pool::TransactionPool;
@@ -75,7 +75,7 @@ struct EngineApiInner<Provider, EngineT: EngineTypes, Pool, Validator, ChainSpec
 impl<Provider, EngineT, Pool, Validator, ChainSpec>
     EngineApi<Provider, EngineT, Pool, Validator, ChainSpec>
 where
-    Provider: HeaderProvider + BlockReader + StateProviderFactory + EvmEnvProvider + 'static,
+    Provider: HeaderProvider + BlockReader + StateProviderFactory + 'static,
     EngineT: EngineTypes,
     Pool: TransactionPool + 'static,
     Validator: EngineValidator<EngineT>,
@@ -172,7 +172,7 @@ where
         &self,
         payload: ExecutionPayloadInputV2,
     ) -> EngineApiResult<PayloadStatus> {
-        let payload = convert_payload_input_v2_to_payload(payload);
+        let payload = payload.into_payload();
         let payload_or_attrs =
             PayloadOrAttributes::<'_, EngineT::PayloadAttributes>::from_execution_payload(
                 &payload, None,
@@ -275,7 +275,7 @@ where
                 payload,
                 ExecutionPayloadSidecar::v4(
                     CancunPayloadFields { versioned_hashes, parent_beacon_block_root },
-                    execution_requests,
+                    PraguePayloadFields { requests: RequestsOrHash::Requests(execution_requests) },
                 ),
             )
             .await
@@ -487,7 +487,7 @@ where
         f: F,
     ) -> EngineApiResult<Vec<Option<R>>>
     where
-        F: Fn(Block) -> R + Send + 'static,
+        F: Fn(Provider::Block) -> R + Send + 'static,
         R: Send + 'static,
     {
         let (tx, rx) = oneshot::channel();
@@ -560,7 +560,7 @@ where
         f: F,
     ) -> EngineApiResult<Vec<Option<R>>>
     where
-        F: Fn(Block) -> R + Send + 'static,
+        F: Fn(Provider::Block) -> R + Send + 'static,
         R: Send + 'static,
     {
         let len = hashes.len() as u64;
@@ -614,7 +614,7 @@ where
         let merge_terminal_td = self
             .inner
             .chain_spec
-            .fork(EthereumHardfork::Paris)
+            .ethereum_fork_activation(EthereumHardfork::Paris)
             .ttd()
             .expect("the engine API should not be running for chains w/o paris");
 
@@ -735,7 +735,7 @@ where
 impl<Provider, EngineT, Pool, Validator, ChainSpec> EngineApiServer<EngineT>
     for EngineApi<Provider, EngineT, Pool, Validator, ChainSpec>
 where
-    Provider: HeaderProvider + BlockReader + StateProviderFactory + EvmEnvProvider + 'static,
+    Provider: HeaderProvider + BlockReader + StateProviderFactory + 'static,
     EngineT: EngineTypes,
     Pool: TransactionPool + 'static,
     Validator: EngineValidator<EngineT>,
@@ -1023,17 +1023,14 @@ mod tests {
     use super::*;
     use alloy_rpc_types_engine::{ClientCode, ClientVersionV1};
     use assert_matches::assert_matches;
-    use reth_beacon_consensus::BeaconConsensusEngineEvent;
-    use reth_chainspec::{ChainSpec, MAINNET};
+    use reth_chainspec::{ChainSpec, EthereumHardfork, MAINNET};
     use reth_engine_primitives::BeaconEngineMessage;
     use reth_ethereum_engine_primitives::{EthEngineTypes, EthereumEngineValidator};
     use reth_payload_builder::test_utils::spawn_test_payload_service;
-    use reth_primitives::SealedBlock;
+    use reth_primitives::{Block, TransactionSigned};
     use reth_provider::test_utils::MockEthProvider;
-    use reth_rpc_types_compat::engine::payload::execution_payload_from_sealed_block;
     use reth_tasks::TokioTaskExecutor;
     use reth_testing_utils::generators::random_block;
-    use reth_tokio_util::EventSender;
     use reth_transaction_pool::noop::NoopTransactionPool;
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
@@ -1058,12 +1055,11 @@ mod tests {
         let provider = Arc::new(MockEthProvider::default());
         let payload_store = spawn_test_payload_service();
         let (to_engine, engine_rx) = unbounded_channel();
-        let event_sender: EventSender<BeaconConsensusEngineEvent> = Default::default();
         let task_executor = Box::<TokioTaskExecutor>::default();
         let api = EngineApi::new(
             provider.clone(),
             chain_spec.clone(),
-            BeaconConsensusEngineHandle::new(to_engine, event_sender),
+            BeaconConsensusEngineHandle::new(to_engine),
             payload_store.into(),
             NoopTransactionPool::default(),
             task_executor,
@@ -1099,9 +1095,11 @@ mod tests {
         let (mut handle, api) = setup_engine_api();
 
         tokio::spawn(async move {
-            api.new_payload_v1(execution_payload_from_sealed_block(SealedBlock::default()))
-                .await
-                .unwrap();
+            api.new_payload_v1(ExecutionPayloadV1::from_block_slow(
+                &Block::<TransactionSigned>::default(),
+            ))
+            .await
+            .unwrap();
         });
         assert_matches!(handle.from_api.recv().await, Some(BeaconEngineMessage::NewPayload { .. }));
     }
@@ -1109,6 +1107,7 @@ mod tests {
     // tests covering `engine_getPayloadBodiesByRange` and `engine_getPayloadBodiesByHash`
     mod get_payload_bodies {
         use super::*;
+        use alloy_rpc_types_engine::ExecutionPayloadBodyV1;
         use reth_testing_utils::generators::{self, random_block_range, BlockRangeParams};
 
         #[tokio::test]
@@ -1154,7 +1153,7 @@ mod tests {
             let expected = blocks
                 .iter()
                 .cloned()
-                .map(|b| Some(convert_to_payload_body_v1(b.unseal())))
+                .map(|b| Some(ExecutionPayloadBodyV1::from_block(b.unseal::<Block>())))
                 .collect::<Vec<_>>();
 
             let res = api.get_payload_bodies_by_range_v1(start, count).await.unwrap();
@@ -1196,7 +1195,7 @@ mod tests {
                     if first_missing_range.contains(&b.number) {
                         None
                     } else {
-                        Some(convert_to_payload_body_v1(b.unseal()))
+                        Some(ExecutionPayloadBodyV1::from_block(b.unseal::<Block>()))
                     }
                 })
                 .collect::<Vec<_>>();
@@ -1215,7 +1214,7 @@ mod tests {
                     {
                         None
                     } else {
-                        Some(convert_to_payload_body_v1(b.unseal()))
+                        Some(ExecutionPayloadBodyV1::from_block(b.unseal::<Block>()))
                     }
                 })
                 .collect::<Vec<_>>();

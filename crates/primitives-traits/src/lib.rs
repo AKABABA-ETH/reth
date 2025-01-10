@@ -1,4 +1,22 @@
-//! Common abstracted types in Reth.
+//! Commonly used types and traits in Reth.
+//!
+//! This crate contains various primitive traits used across reth's components.
+//! It provides the [`Block`] trait which is used to represent a block and all its components.
+//! A [`Block`] is composed of a [`Header`] and a [`BlockBody`]. In ethereum (and optimism), a block
+//! body consists of a list of transactions, a list of uncle headers, and a list of withdrawals. For
+//! optimism, uncle headers and withdrawals are always empty lists.
+//!
+//! ## Feature Flags
+//!
+//! - `arbitrary`: Adds `proptest` and `arbitrary` support for primitive types.
+//! - `op`: Implements the traits for various [op-alloy](https://github.com/alloy-rs/op-alloy)
+//!   types.
+//! - `reth-codec`: Enables db codec support for reth types including zstd compression for certain
+//!   types.
+//! - `serde`: Adds serde support for all types.
+//! - `secp256k1`: Adds secp256k1 support for transaction signing/recovery. (By default the no-std
+//!   friendly `k256` is used)
+//! - `rayon`: Uses `rayon` for parallel transaction sender recovery in [`BlockBody`] by default.
 
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/paradigmxyz/reth/main/assets/reth-docs.png",
@@ -14,7 +32,6 @@ extern crate alloc;
 
 /// Common constants.
 pub mod constants;
-
 pub use constants::gas_units::{format_gas, format_gas_throughput};
 
 /// Minimal account
@@ -26,21 +43,23 @@ pub use receipt::{FullReceipt, Receipt};
 
 pub mod transaction;
 pub use transaction::{
+    execute::FillTxEnv,
     signed::{FullSignedTx, SignedTransaction},
-    FullTransaction, Transaction, TransactionExt,
+    FullTransaction, Transaction,
 };
-
-mod integer_list;
-pub use integer_list::{IntegerList, IntegerListError};
 
 pub mod block;
 pub use block::{
-    body::BlockBody,
+    body::{BlockBody, FullBlockBody},
     header::{BlockHeader, FullBlockHeader},
     Block, FullBlock,
 };
 
+mod encoded;
 mod withdrawal;
+pub use encoded::WithEncoded;
+
+pub mod crypto;
 
 mod error;
 pub use error::{GotExpected, GotExpectedBoxed};
@@ -51,15 +70,11 @@ pub use alloy_primitives::{logs_bloom, Log, LogData};
 mod storage;
 pub use storage::StorageEntry;
 
-/// Transaction types
-pub mod tx_type;
-pub use tx_type::{FullTxType, TxType};
+pub mod sync;
 
 /// Common header types
 pub mod header;
-#[cfg(any(test, feature = "arbitrary", feature = "test-utils"))]
-pub use header::test_utils;
-pub use header::{BlockWithParent, HeaderError, SealedHeader};
+pub use header::{Header, HeaderError, SealedHeader};
 
 /// Bincode-compatible serde implementations for common abstracted types in Reth.
 ///
@@ -69,9 +84,7 @@ pub use header::{BlockWithParent, HeaderError, SealedHeader};
 ///
 /// Read more: <https://github.com/bincode-org/bincode/issues/326>
 #[cfg(feature = "serde-bincode-compat")]
-pub mod serde_bincode_compat {
-    pub use super::header::{serde_bincode_compat as header, serde_bincode_compat::*};
-}
+pub mod serde_bincode_compat;
 
 /// Heuristic size trait
 pub mod size;
@@ -79,19 +92,7 @@ pub use size::InMemorySize;
 
 /// Node traits
 pub mod node;
-pub use node::{FullNodePrimitives, NodePrimitives};
-
-/// Helper trait that requires arbitrary implementation if the feature is enabled.
-#[cfg(any(feature = "test-utils", feature = "arbitrary"))]
-pub trait MaybeArbitrary: for<'a> arbitrary::Arbitrary<'a> {}
-/// Helper trait that requires arbitrary implementation if the feature is enabled.
-#[cfg(not(any(feature = "test-utils", feature = "arbitrary")))]
-pub trait MaybeArbitrary {}
-
-#[cfg(any(feature = "test-utils", feature = "arbitrary"))]
-impl<T> MaybeArbitrary for T where T: for<'a> arbitrary::Arbitrary<'a> {}
-#[cfg(not(any(feature = "test-utils", feature = "arbitrary")))]
-impl<T> MaybeArbitrary for T {}
+pub use node::{BodyTy, FullNodePrimitives, HeaderTy, NodePrimitives, ReceiptTy};
 
 /// Helper trait that requires de-/serialize implementation since `serde` feature is enabled.
 #[cfg(feature = "serde")]
@@ -105,3 +106,38 @@ pub trait MaybeSerde {}
 impl<T> MaybeSerde for T where T: serde::Serialize + for<'de> serde::Deserialize<'de> {}
 #[cfg(not(feature = "serde"))]
 impl<T> MaybeSerde for T {}
+
+/// Helper trait that requires database encoding implementation since `reth-codec` feature is
+/// enabled.
+#[cfg(feature = "reth-codec")]
+pub trait MaybeCompact: reth_codecs::Compact {}
+/// Noop. Helper trait that would require database encoding implementation if `reth-codec` feature
+/// were enabled.
+#[cfg(not(feature = "reth-codec"))]
+pub trait MaybeCompact {}
+
+#[cfg(feature = "reth-codec")]
+impl<T> MaybeCompact for T where T: reth_codecs::Compact {}
+#[cfg(not(feature = "reth-codec"))]
+impl<T> MaybeCompact for T {}
+
+/// Helper trait that requires serde bincode compatibility implementation.
+#[cfg(feature = "serde-bincode-compat")]
+pub trait MaybeSerdeBincodeCompat: crate::serde_bincode_compat::SerdeBincodeCompat {}
+/// Noop. Helper trait that would require serde bincode compatibility implementation if
+/// `serde-bincode-compat` feature were enabled.
+#[cfg(not(feature = "serde-bincode-compat"))]
+pub trait MaybeSerdeBincodeCompat {}
+
+#[cfg(feature = "serde-bincode-compat")]
+impl<T> MaybeSerdeBincodeCompat for T where T: crate::serde_bincode_compat::SerdeBincodeCompat {}
+#[cfg(not(feature = "serde-bincode-compat"))]
+impl<T> MaybeSerdeBincodeCompat for T {}
+
+/// Utilities for testing.
+#[cfg(any(test, feature = "arbitrary", feature = "test-utils"))]
+pub mod test_utils {
+    pub use crate::header::test_utils::{generate_valid_header, valid_header_strategy};
+    #[cfg(feature = "test-utils")]
+    pub use crate::{block::TestBlock, header::test_utils::TestHeader};
+}

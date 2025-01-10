@@ -8,13 +8,9 @@ crates=($(cargo metadata --format-version=1 --no-deps | jq -r '.packages[].name'
 # Used with the `contains` function.
 # shellcheck disable=SC2034
 exclude_crates=(
-  # The following are not working yet, but known to be fixable
-  reth-exex-types # https://github.com/paradigmxyz/reth/issues/9946
   # The following require investigation if they can be fixed
   reth-basic-payload-builder
-  reth-beacon-consensus
   reth-bench
-  reth-blockchain-tree
   reth-cli
   reth-cli-commands
   reth-cli-runner

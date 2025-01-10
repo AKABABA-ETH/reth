@@ -12,10 +12,10 @@ use super::{
     NewPooledTransactionHashes68, NodeData, PooledTransactions, Receipts, Status, Transactions,
 };
 use crate::{EthNetworkPrimitives, EthVersion, NetworkPrimitives, SharedTransactions};
-
+use alloc::{boxed::Box, sync::Arc};
 use alloy_primitives::bytes::{Buf, BufMut};
 use alloy_rlp::{length_of_length, Decodable, Encodable, Header};
-use std::{fmt::Debug, sync::Arc};
+use core::fmt::Debug;
 
 /// [`MAX_MESSAGE_SIZE`] is the maximum cap on the size of a protocol message.
 // https://github.com/ethereum/go-ethereum/blob/30602163d5d8321fbc68afdcbbaf2362b2641bde/eth/protocols/eth/protocol.go#L50
@@ -183,7 +183,11 @@ pub enum EthMessage<N: NetworkPrimitives = EthNetworkPrimitives> {
     )]
     NewBlock(Box<NewBlock<N::Block>>),
     /// Represents a Transactions message broadcast to the network.
-    Transactions(Transactions),
+    #[cfg_attr(
+        feature = "serde",
+        serde(bound = "N::BroadcastedTransaction: serde::Serialize + serde::de::DeserializeOwned")
+    )]
+    Transactions(Transactions<N::BroadcastedTransaction>),
     /// Represents a `NewPooledTransactionHashes` message for eth/66 version.
     NewPooledTransactionHashes66(NewPooledTransactionHashes66),
     /// Represents a `NewPooledTransactionHashes` message for eth/68 version.
@@ -208,7 +212,11 @@ pub enum EthMessage<N: NetworkPrimitives = EthNetworkPrimitives> {
     /// Represents a `GetPooledTransactions` request-response pair.
     GetPooledTransactions(RequestPair<GetPooledTransactions>),
     /// Represents a `PooledTransactions` request-response pair.
-    PooledTransactions(RequestPair<PooledTransactions>),
+    #[cfg_attr(
+        feature = "serde",
+        serde(bound = "N::PooledTransaction: serde::Serialize + serde::de::DeserializeOwned")
+    )]
+    PooledTransactions(RequestPair<PooledTransactions<N::PooledTransaction>>),
     /// Represents a `GetNodeData` request-response pair.
     GetNodeData(RequestPair<GetNodeData>),
     /// Represents a `NodeData` request-response pair.
@@ -216,7 +224,11 @@ pub enum EthMessage<N: NetworkPrimitives = EthNetworkPrimitives> {
     /// Represents a `GetReceipts` request-response pair.
     GetReceipts(RequestPair<GetReceipts>),
     /// Represents a Receipts request-response pair.
-    Receipts(RequestPair<Receipts>),
+    #[cfg_attr(
+        feature = "serde",
+        serde(bound = "N::Receipt: serde::Serialize + serde::de::DeserializeOwned")
+    )]
+    Receipts(RequestPair<Receipts<N::Receipt>>),
 }
 
 impl<N: NetworkPrimitives> EthMessage<N> {
@@ -299,7 +311,7 @@ pub enum EthBroadcastMessage<N: NetworkPrimitives = EthNetworkPrimitives> {
     /// Represents a new block broadcast message.
     NewBlock(Arc<NewBlock<N::Block>>),
     /// Represents a transactions broadcast message.
-    Transactions(SharedTransactions),
+    Transactions(SharedTransactions<N::BroadcastedTransaction>),
 }
 
 // === impl EthBroadcastMessage ===

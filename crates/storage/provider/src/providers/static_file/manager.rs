@@ -7,11 +7,8 @@ use crate::{
     ReceiptProvider, StageCheckpointReader, StatsReader, TransactionVariant, TransactionsProvider,
     TransactionsProviderExt, WithdrawalsProvider,
 };
-use alloy_consensus::Header;
-use alloy_eips::{
-    eip4895::{Withdrawal, Withdrawals},
-    BlockHashOrNumber,
-};
+use alloy_consensus::{transaction::TransactionMeta, Header};
+use alloy_eips::{eip2718::Encodable2718, eip4895::Withdrawals, BlockHashOrNumber};
 use alloy_primitives::{keccak256, Address, BlockHash, BlockNumber, TxHash, TxNumber, B256, U256};
 use dashmap::DashMap;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -19,27 +16,29 @@ use parking_lot::RwLock;
 use reth_chainspec::{ChainInfo, ChainSpecProvider};
 use reth_db::{
     lockfile::StorageLock,
-    static_file::{iter_static_files, HeaderMask, ReceiptMask, StaticFileCursor, TransactionMask},
+    static_file::{
+        iter_static_files, BlockHashMask, HeaderMask, HeaderWithHashMask, ReceiptMask,
+        StaticFileCursor, TDWithHashMask, TransactionMask,
+    },
+    table::{Decompress, Value},
     tables,
 };
 use reth_db_api::{
-    cursor::DbCursorRO,
-    models::{CompactU256, StoredBlockBodyIndices},
-    table::Table,
-    transaction::DbTx,
+    cursor::DbCursorRO, models::StoredBlockBodyIndices, table::Table, transaction::DbTx,
 };
 use reth_nippy_jar::{NippyJar, NippyJarChecker, CONFIG_FILE_EXTENSION};
-use reth_node_types::NodePrimitives;
+use reth_node_types::{FullNodePrimitives, NodePrimitives};
 use reth_primitives::{
     static_file::{
         find_fixed_range, HighestStaticFiles, SegmentHeader, SegmentRangeInclusive,
         DEFAULT_BLOCKS_PER_STATIC_FILE,
     },
-    Block, BlockWithSenders, Receipt, SealedBlock, SealedBlockWithSenders, SealedHeader,
-    StaticFileSegment, TransactionMeta, TransactionSigned, TransactionSignedNoHash,
+    BlockWithSenders, Receipt, SealedBlockFor, SealedBlockWithSenders, SealedHeader,
+    StaticFileSegment, TransactionSigned,
 };
+use reth_primitives_traits::SignedTransaction;
 use reth_stages_types::{PipelineTarget, StageId};
-use reth_storage_api::DBProvider;
+use reth_storage_api::{BlockBodyIndicesProvider, DBProvider, OmmersProvider};
 use reth_storage_errors::provider::{ProviderError, ProviderResult};
 use std::{
     collections::{hash_map::Entry, BTreeMap, HashMap},
@@ -1231,12 +1230,14 @@ impl<N: NodePrimitives> StaticFileWriter for StaticFileProvider<N> {
     }
 }
 
-impl<N: NodePrimitives> HeaderProvider for StaticFileProvider<N> {
-    fn header(&self, block_hash: &BlockHash) -> ProviderResult<Option<Header>> {
+impl<N: NodePrimitives<BlockHeader: Value>> HeaderProvider for StaticFileProvider<N> {
+    type Header = N::BlockHeader;
+
+    fn header(&self, block_hash: &BlockHash) -> ProviderResult<Option<Self::Header>> {
         self.find_static_file(StaticFileSegment::Headers, |jar_provider| {
             Ok(jar_provider
                 .cursor()?
-                .get_two::<HeaderMask<Header, BlockHash>>(block_hash.into())?
+                .get_two::<HeaderWithHashMask<Self::Header>>(block_hash.into())?
                 .and_then(|(header, hash)| {
                     if &hash == block_hash {
                         return Some(header)
@@ -1246,7 +1247,7 @@ impl<N: NodePrimitives> HeaderProvider for StaticFileProvider<N> {
         })
     }
 
-    fn header_by_number(&self, num: BlockNumber) -> ProviderResult<Option<Header>> {
+    fn header_by_number(&self, num: BlockNumber) -> ProviderResult<Option<Self::Header>> {
         self.get_segment_provider_from_block(StaticFileSegment::Headers, num, None)
             .and_then(|provider| provider.header_by_number(num))
             .or_else(|err| {
@@ -1262,7 +1263,7 @@ impl<N: NodePrimitives> HeaderProvider for StaticFileProvider<N> {
         self.find_static_file(StaticFileSegment::Headers, |jar_provider| {
             Ok(jar_provider
                 .cursor()?
-                .get_two::<HeaderMask<CompactU256, BlockHash>>(block_hash.into())?
+                .get_two::<TDWithHashMask>(block_hash.into())?
                 .and_then(|(td, hash)| (&hash == block_hash).then_some(td.0)))
         })
     }
@@ -1279,16 +1280,22 @@ impl<N: NodePrimitives> HeaderProvider for StaticFileProvider<N> {
             })
     }
 
-    fn headers_range(&self, range: impl RangeBounds<BlockNumber>) -> ProviderResult<Vec<Header>> {
+    fn headers_range(
+        &self,
+        range: impl RangeBounds<BlockNumber>,
+    ) -> ProviderResult<Vec<Self::Header>> {
         self.fetch_range_with_predicate(
             StaticFileSegment::Headers,
             to_range(range),
-            |cursor, number| cursor.get_one::<HeaderMask<Header>>(number.into()),
+            |cursor, number| cursor.get_one::<HeaderMask<Self::Header>>(number.into()),
             |_| true,
         )
     }
 
-    fn sealed_header(&self, num: BlockNumber) -> ProviderResult<Option<SealedHeader>> {
+    fn sealed_header(
+        &self,
+        num: BlockNumber,
+    ) -> ProviderResult<Option<SealedHeader<Self::Header>>> {
         self.get_segment_provider_from_block(StaticFileSegment::Headers, num, None)
             .and_then(|provider| provider.sealed_header(num))
             .or_else(|err| {
@@ -1303,14 +1310,14 @@ impl<N: NodePrimitives> HeaderProvider for StaticFileProvider<N> {
     fn sealed_headers_while(
         &self,
         range: impl RangeBounds<BlockNumber>,
-        predicate: impl FnMut(&SealedHeader) -> bool,
-    ) -> ProviderResult<Vec<SealedHeader>> {
+        predicate: impl FnMut(&SealedHeader<Self::Header>) -> bool,
+    ) -> ProviderResult<Vec<SealedHeader<Self::Header>>> {
         self.fetch_range_with_predicate(
             StaticFileSegment::Headers,
             to_range(range),
             |cursor, number| {
                 Ok(cursor
-                    .get_two::<HeaderMask<Header, BlockHash>>(number.into())?
+                    .get_two::<HeaderWithHashMask<Self::Header>>(number.into())?
                     .map(|(header, hash)| SealedHeader::new(header, hash)))
             },
             predicate,
@@ -1331,14 +1338,18 @@ impl<N: NodePrimitives> BlockHashReader for StaticFileProvider<N> {
         self.fetch_range_with_predicate(
             StaticFileSegment::Headers,
             start..end,
-            |cursor, number| cursor.get_one::<HeaderMask<BlockHash>>(number.into()),
+            |cursor, number| cursor.get_one::<BlockHashMask>(number.into()),
             |_| true,
         )
     }
 }
 
-impl<N: NodePrimitives> ReceiptProvider for StaticFileProvider<N> {
-    fn receipt(&self, num: TxNumber) -> ProviderResult<Option<Receipt>> {
+impl<N: NodePrimitives<SignedTx: Value + SignedTransaction, Receipt: Value>> ReceiptProvider
+    for StaticFileProvider<N>
+{
+    type Receipt = N::Receipt;
+
+    fn receipt(&self, num: TxNumber) -> ProviderResult<Option<Self::Receipt>> {
         self.get_segment_provider_from_transaction(StaticFileSegment::Receipts, num, None)
             .and_then(|provider| provider.receipt(num))
             .or_else(|err| {
@@ -1350,31 +1361,36 @@ impl<N: NodePrimitives> ReceiptProvider for StaticFileProvider<N> {
             })
     }
 
-    fn receipt_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Receipt>> {
+    fn receipt_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Receipt>> {
         if let Some(num) = self.transaction_id(hash)? {
             return self.receipt(num)
         }
         Ok(None)
     }
 
-    fn receipts_by_block(&self, _block: BlockHashOrNumber) -> ProviderResult<Option<Vec<Receipt>>> {
+    fn receipts_by_block(
+        &self,
+        _block: BlockHashOrNumber,
+    ) -> ProviderResult<Option<Vec<Self::Receipt>>> {
         unreachable!()
     }
 
     fn receipts_by_tx_range(
         &self,
         range: impl RangeBounds<TxNumber>,
-    ) -> ProviderResult<Vec<Receipt>> {
+    ) -> ProviderResult<Vec<Self::Receipt>> {
         self.fetch_range_with_predicate(
             StaticFileSegment::Receipts,
             to_range(range),
-            |cursor, number| cursor.get_one::<ReceiptMask<Receipt>>(number.into()),
+            |cursor, number| cursor.get_one::<ReceiptMask<Self::Receipt>>(number.into()),
             |_| true,
         )
     }
 }
 
-impl<N: NodePrimitives> TransactionsProviderExt for StaticFileProvider<N> {
+impl<N: FullNodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>>
+    TransactionsProviderExt for StaticFileProvider<N>
+{
     fn transaction_hashes_by_range(
         &self,
         tx_range: Range<TxNumber>,
@@ -1409,7 +1425,7 @@ impl<N: NodePrimitives> TransactionsProviderExt for StaticFileProvider<N> {
                     chunk_range,
                     |cursor, number| {
                         Ok(cursor
-                            .get_one::<TransactionMask<TransactionSignedNoHash>>(number.into())?
+                            .get_one::<TransactionMask<Self::Transaction>>(number.into())?
                             .map(|transaction| {
                                 rlp_buf.clear();
                                 let _ = channel_tx
@@ -1435,13 +1451,17 @@ impl<N: NodePrimitives> TransactionsProviderExt for StaticFileProvider<N> {
     }
 }
 
-impl<N: NodePrimitives> TransactionsProvider for StaticFileProvider<N> {
+impl<N: NodePrimitives<SignedTx: Decompress + SignedTransaction>> TransactionsProvider
+    for StaticFileProvider<N>
+{
+    type Transaction = N::SignedTx;
+
     fn transaction_id(&self, tx_hash: TxHash) -> ProviderResult<Option<TxNumber>> {
         self.find_static_file(StaticFileSegment::Transactions, |jar_provider| {
             let mut cursor = jar_provider.cursor()?;
             if cursor
-                .get_one::<TransactionMask<TransactionSignedNoHash>>((&tx_hash).into())?
-                .and_then(|tx| (tx.hash() == tx_hash).then_some(tx))
+                .get_one::<TransactionMask<Self::Transaction>>((&tx_hash).into())?
+                .and_then(|tx| (tx.trie_hash() == tx_hash).then_some(tx))
                 .is_some()
             {
                 Ok(cursor.number())
@@ -1451,7 +1471,7 @@ impl<N: NodePrimitives> TransactionsProvider for StaticFileProvider<N> {
         })
     }
 
-    fn transaction_by_id(&self, num: TxNumber) -> ProviderResult<Option<TransactionSigned>> {
+    fn transaction_by_id(&self, num: TxNumber) -> ProviderResult<Option<Self::Transaction>> {
         self.get_segment_provider_from_transaction(StaticFileSegment::Transactions, num, None)
             .and_then(|provider| provider.transaction_by_id(num))
             .or_else(|err| {
@@ -1463,12 +1483,12 @@ impl<N: NodePrimitives> TransactionsProvider for StaticFileProvider<N> {
             })
     }
 
-    fn transaction_by_id_no_hash(
+    fn transaction_by_id_unhashed(
         &self,
         num: TxNumber,
-    ) -> ProviderResult<Option<TransactionSignedNoHash>> {
+    ) -> ProviderResult<Option<Self::Transaction>> {
         self.get_segment_provider_from_transaction(StaticFileSegment::Transactions, num, None)
-            .and_then(|provider| provider.transaction_by_id_no_hash(num))
+            .and_then(|provider| provider.transaction_by_id_unhashed(num))
             .or_else(|err| {
                 if let ProviderError::MissingStaticFileTx(_, _) = err {
                     Ok(None)
@@ -1478,20 +1498,19 @@ impl<N: NodePrimitives> TransactionsProvider for StaticFileProvider<N> {
             })
     }
 
-    fn transaction_by_hash(&self, hash: TxHash) -> ProviderResult<Option<TransactionSigned>> {
+    fn transaction_by_hash(&self, hash: TxHash) -> ProviderResult<Option<Self::Transaction>> {
         self.find_static_file(StaticFileSegment::Transactions, |jar_provider| {
             Ok(jar_provider
                 .cursor()?
-                .get_one::<TransactionMask<TransactionSignedNoHash>>((&hash).into())?
-                .map(|tx| tx.with_hash())
-                .and_then(|tx| (tx.hash_ref() == &hash).then_some(tx)))
+                .get_one::<TransactionMask<Self::Transaction>>((&hash).into())?
+                .and_then(|tx| (tx.trie_hash() == hash).then_some(tx)))
         })
     }
 
     fn transaction_by_hash_with_meta(
         &self,
         _hash: TxHash,
-    ) -> ProviderResult<Option<(TransactionSigned, TransactionMeta)>> {
+    ) -> ProviderResult<Option<(Self::Transaction, TransactionMeta)>> {
         // Required data not present in static_files
         Err(ProviderError::UnsupportedProvider)
     }
@@ -1504,7 +1523,7 @@ impl<N: NodePrimitives> TransactionsProvider for StaticFileProvider<N> {
     fn transactions_by_block(
         &self,
         _block_id: BlockHashOrNumber,
-    ) -> ProviderResult<Option<Vec<TransactionSigned>>> {
+    ) -> ProviderResult<Option<Vec<Self::Transaction>>> {
         // Required data not present in static_files
         Err(ProviderError::UnsupportedProvider)
     }
@@ -1512,7 +1531,7 @@ impl<N: NodePrimitives> TransactionsProvider for StaticFileProvider<N> {
     fn transactions_by_block_range(
         &self,
         _range: impl RangeBounds<BlockNumber>,
-    ) -> ProviderResult<Vec<Vec<TransactionSigned>>> {
+    ) -> ProviderResult<Vec<Vec<Self::Transaction>>> {
         // Required data not present in static_files
         Err(ProviderError::UnsupportedProvider)
     }
@@ -1520,13 +1539,11 @@ impl<N: NodePrimitives> TransactionsProvider for StaticFileProvider<N> {
     fn transactions_by_tx_range(
         &self,
         range: impl RangeBounds<TxNumber>,
-    ) -> ProviderResult<Vec<TransactionSignedNoHash>> {
+    ) -> ProviderResult<Vec<Self::Transaction>> {
         self.fetch_range_with_predicate(
             StaticFileSegment::Transactions,
             to_range(range),
-            |cursor, number| {
-                cursor.get_one::<TransactionMask<TransactionSignedNoHash>>(number.into())
-            },
+            |cursor, number| cursor.get_one::<TransactionMask<Self::Transaction>>(number.into()),
             |_| true,
         )
     }
@@ -1536,12 +1553,12 @@ impl<N: NodePrimitives> TransactionsProvider for StaticFileProvider<N> {
         range: impl RangeBounds<TxNumber>,
     ) -> ProviderResult<Vec<Address>> {
         let txes = self.transactions_by_tx_range(range)?;
-        TransactionSignedNoHash::recover_signers(&txes, txes.len())
+        reth_primitives_traits::transaction::recover::recover_signers(&txes)
             .ok_or(ProviderError::SenderRecoveryError)
     }
 
     fn transaction_sender(&self, id: TxNumber) -> ProviderResult<Option<Address>> {
-        Ok(self.transaction_by_id_no_hash(id)?.and_then(|tx| tx.recover_signer()))
+        Ok(self.transaction_by_id_unhashed(id)?.and_then(|tx| tx.recover_signer()))
     }
 }
 
@@ -1569,42 +1586,40 @@ impl<N: NodePrimitives> BlockNumReader for StaticFileProvider<N> {
     }
 }
 
-impl<N: NodePrimitives> BlockReader for StaticFileProvider<N> {
+impl<N: FullNodePrimitives<SignedTx: Value, Receipt: Value, BlockHeader: Value>> BlockReader
+    for StaticFileProvider<N>
+{
+    type Block = N::Block;
+
     fn find_block_by_hash(
         &self,
         _hash: B256,
         _source: BlockSource,
-    ) -> ProviderResult<Option<Block>> {
+    ) -> ProviderResult<Option<Self::Block>> {
         // Required data not present in static_files
         Err(ProviderError::UnsupportedProvider)
     }
 
-    fn block(&self, _id: BlockHashOrNumber) -> ProviderResult<Option<Block>> {
+    fn block(&self, _id: BlockHashOrNumber) -> ProviderResult<Option<Self::Block>> {
         // Required data not present in static_files
         Err(ProviderError::UnsupportedProvider)
     }
 
-    fn pending_block(&self) -> ProviderResult<Option<SealedBlock>> {
+    fn pending_block(&self) -> ProviderResult<Option<SealedBlockFor<Self::Block>>> {
         // Required data not present in static_files
         Err(ProviderError::UnsupportedProvider)
     }
 
-    fn pending_block_with_senders(&self) -> ProviderResult<Option<SealedBlockWithSenders>> {
+    fn pending_block_with_senders(
+        &self,
+    ) -> ProviderResult<Option<SealedBlockWithSenders<Self::Block>>> {
         // Required data not present in static_files
         Err(ProviderError::UnsupportedProvider)
     }
 
-    fn pending_block_and_receipts(&self) -> ProviderResult<Option<(SealedBlock, Vec<Receipt>)>> {
-        // Required data not present in static_files
-        Err(ProviderError::UnsupportedProvider)
-    }
-
-    fn ommers(&self, _id: BlockHashOrNumber) -> ProviderResult<Option<Vec<Header>>> {
-        // Required data not present in static_files
-        Err(ProviderError::UnsupportedProvider)
-    }
-
-    fn block_body_indices(&self, _num: u64) -> ProviderResult<Option<StoredBlockBodyIndices>> {
+    fn pending_block_and_receipts(
+        &self,
+    ) -> ProviderResult<Option<(SealedBlockFor<Self::Block>, Vec<Self::Receipt>)>> {
         // Required data not present in static_files
         Err(ProviderError::UnsupportedProvider)
     }
@@ -1613,7 +1628,7 @@ impl<N: NodePrimitives> BlockReader for StaticFileProvider<N> {
         &self,
         _id: BlockHashOrNumber,
         _transaction_kind: TransactionVariant,
-    ) -> ProviderResult<Option<BlockWithSenders>> {
+    ) -> ProviderResult<Option<BlockWithSenders<Self::Block>>> {
         // Required data not present in static_files
         Err(ProviderError::UnsupportedProvider)
     }
@@ -1622,12 +1637,12 @@ impl<N: NodePrimitives> BlockReader for StaticFileProvider<N> {
         &self,
         _id: BlockHashOrNumber,
         _transaction_kind: TransactionVariant,
-    ) -> ProviderResult<Option<SealedBlockWithSenders>> {
+    ) -> ProviderResult<Option<SealedBlockWithSenders<Self::Block>>> {
         // Required data not present in static_files
         Err(ProviderError::UnsupportedProvider)
     }
 
-    fn block_range(&self, _range: RangeInclusive<BlockNumber>) -> ProviderResult<Vec<Block>> {
+    fn block_range(&self, _range: RangeInclusive<BlockNumber>) -> ProviderResult<Vec<Self::Block>> {
         // Required data not present in static_files
         Err(ProviderError::UnsupportedProvider)
     }
@@ -1635,14 +1650,14 @@ impl<N: NodePrimitives> BlockReader for StaticFileProvider<N> {
     fn block_with_senders_range(
         &self,
         _range: RangeInclusive<BlockNumber>,
-    ) -> ProviderResult<Vec<BlockWithSenders>> {
+    ) -> ProviderResult<Vec<BlockWithSenders<Self::Block>>> {
         Err(ProviderError::UnsupportedProvider)
     }
 
     fn sealed_block_with_senders_range(
         &self,
         _range: RangeInclusive<BlockNumber>,
-    ) -> ProviderResult<Vec<SealedBlockWithSenders>> {
+    ) -> ProviderResult<Vec<SealedBlockWithSenders<Self::Block>>> {
         Err(ProviderError::UnsupportedProvider)
     }
 }
@@ -1656,8 +1671,17 @@ impl<N: NodePrimitives> WithdrawalsProvider for StaticFileProvider<N> {
         // Required data not present in static_files
         Err(ProviderError::UnsupportedProvider)
     }
+}
 
-    fn latest_withdrawal(&self) -> ProviderResult<Option<Withdrawal>> {
+impl<N: FullNodePrimitives<BlockHeader: Value>> OmmersProvider for StaticFileProvider<N> {
+    fn ommers(&self, _id: BlockHashOrNumber) -> ProviderResult<Option<Vec<Self::Header>>> {
+        // Required data not present in static_files
+        Err(ProviderError::UnsupportedProvider)
+    }
+}
+
+impl<N: Send + Sync> BlockBodyIndicesProvider for StaticFileProvider<N> {
+    fn block_body_indices(&self, _num: u64) -> ProviderResult<Option<StoredBlockBodyIndices>> {
         // Required data not present in static_files
         Err(ProviderError::UnsupportedProvider)
     }
@@ -1673,11 +1697,11 @@ impl<N: NodePrimitives> StatsReader for StaticFileProvider<N> {
                 .map(|block| block + 1)
                 .unwrap_or_default()
                 as usize),
-            tables::Receipts::NAME => Ok(self
+            tables::Receipts::<Receipt>::NAME => Ok(self
                 .get_highest_static_file_tx(StaticFileSegment::Receipts)
                 .map(|receipts| receipts + 1)
                 .unwrap_or_default() as usize),
-            tables::Transactions::<TransactionSignedNoHash>::NAME => Ok(self
+            tables::Transactions::<TransactionSigned>::NAME => Ok(self
                 .get_highest_static_file_tx(StaticFileSegment::Transactions)
                 .map(|txs| txs + 1)
                 .unwrap_or_default()
@@ -1689,11 +1713,14 @@ impl<N: NodePrimitives> StatsReader for StaticFileProvider<N> {
 
 /// Calculates the tx hash for the given transaction and its id.
 #[inline]
-fn calculate_hash(
-    entry: (TxNumber, TransactionSignedNoHash),
+fn calculate_hash<T>(
+    entry: (TxNumber, T),
     rlp_buf: &mut Vec<u8>,
-) -> Result<(B256, TxNumber), Box<ProviderError>> {
+) -> Result<(B256, TxNumber), Box<ProviderError>>
+where
+    T: Encodable2718,
+{
     let (tx_id, tx) = entry;
-    tx.transaction.eip2718_encode(&tx.signature, rlp_buf);
+    tx.encode_2718(rlp_buf);
     Ok((keccak256(rlp_buf), tx_id))
 }

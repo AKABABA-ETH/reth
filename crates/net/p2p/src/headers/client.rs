@@ -3,6 +3,7 @@ use alloy_consensus::Header;
 use alloy_eips::BlockHashOrNumber;
 use futures::{Future, FutureExt};
 pub use reth_eth_wire_types::{BlockHeaders, HeadersDirection};
+use reth_primitives_traits::BlockHeader;
 use std::{
     fmt::Debug,
     pin::Pin,
@@ -50,13 +51,14 @@ impl HeadersRequest {
 }
 
 /// The headers future type
-pub type HeadersFut = Pin<Box<dyn Future<Output = PeerRequestResult<Vec<Header>>> + Send + Sync>>;
+pub type HeadersFut<H = Header> =
+    Pin<Box<dyn Future<Output = PeerRequestResult<Vec<H>>> + Send + Sync>>;
 
 /// The block headers downloader client
 #[auto_impl::auto_impl(&, Arc, Box)]
 pub trait HeadersClient: DownloadClient {
     /// The header type this client fetches.
-    type Header: Send + Sync + Unpin;
+    type Header: BlockHeader;
     /// The headers future type
     type Output: Future<Output = PeerRequestResult<Vec<Self::Header>>> + Sync + Send + Unpin;
 
