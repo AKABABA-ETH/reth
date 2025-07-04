@@ -1,5 +1,5 @@
 //! The implementation of the [`PayloadAttributesBuilder`] for the
-//! [`LocalEngineService`](super::service::LocalEngineService).
+//! [`LocalMiner`](super::LocalMiner).
 
 use alloy_primitives::{Address, B256};
 use reth_chainspec::EthereumHardforks;
@@ -11,7 +11,8 @@ use std::sync::Arc;
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct LocalPayloadAttributesBuilder<ChainSpec> {
-    chain_spec: Arc<ChainSpec>,
+    /// The chainspec
+    pub chain_spec: Arc<ChainSpec>,
 }
 
 impl<ChainSpec> LocalPayloadAttributesBuilder<ChainSpec> {
@@ -52,7 +53,11 @@ where
     fn build(&self, timestamp: u64) -> op_alloy_rpc_types_engine::OpPayloadAttributes {
         op_alloy_rpc_types_engine::OpPayloadAttributes {
             payload_attributes: self.build(timestamp),
-            transactions: None,
+            // Add dummy system transaction
+            transactions: Some(vec![
+                reth_optimism_chainspec::constants::TX_SET_L1_BLOCK_OP_MAINNET_BLOCK_124665056
+                    .into(),
+            ]),
             no_tx_pool: None,
             gas_limit: None,
             eip_1559_params: None,

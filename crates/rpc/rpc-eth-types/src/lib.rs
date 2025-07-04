@@ -17,15 +17,11 @@ pub mod id_provider;
 pub mod logs_utils;
 pub mod pending_block;
 pub mod receipt;
-pub mod revm_utils;
 pub mod simulate;
 pub mod transaction;
 pub mod utils;
 
-pub use builder::{
-    config::{EthConfig, EthFilterConfig},
-    ctx::EthApiBuilderCtx,
-};
+pub use builder::config::{EthConfig, EthFilterConfig};
 pub use cache::{
     config::EthStateCacheConfig, db::StateCacheDb, multi_consumer::MultiConsumerLruCache,
     EthStateCache,

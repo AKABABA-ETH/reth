@@ -2,7 +2,7 @@
 
 use crate::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, NetworkArgs, PayloadBuilderArgs,
+        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs, PayloadBuilderArgs,
         PruningArgs, RpcServerArgs, TxPoolArgs,
     },
     dirs::{ChainPath, DataDirPath},
@@ -14,7 +14,7 @@ use alloy_primitives::{BlockNumber, B256};
 use eyre::eyre;
 use reth_chainspec::{ChainSpec, EthChainSpec, MAINNET};
 use reth_config::config::PruneConfig;
-use reth_ethereum_forks::Head;
+use reth_ethereum_forks::{EthereumHardforks, Head};
 use reth_network_p2p::headers::client::HeadersClient;
 use reth_primitives_traits::SealedHeader;
 use reth_stages_types::StageId;
@@ -30,6 +30,18 @@ use std::{
     sync::Arc,
 };
 use tracing::*;
+
+use crate::args::EraArgs;
+pub use reth_engine_primitives::{
+    DEFAULT_MAX_PROOF_TASK_CONCURRENCY, DEFAULT_MEMORY_BLOCK_BUFFER_TARGET,
+    DEFAULT_RESERVED_CPU_CORES,
+};
+
+/// Triggers persistence when the number of canonical blocks in memory exceeds this threshold.
+pub const DEFAULT_PERSISTENCE_THRESHOLD: u64 = 2;
+
+/// Default size of cross-block cache in megabytes.
+pub const DEFAULT_CROSS_BLOCK_CACHE_SIZE_MB: u64 = 4 * 1024;
 
 /// This includes all necessary configuration to launch the node.
 /// The individual configuration options can be overwritten before launching the node.
@@ -108,7 +120,8 @@ pub struct NodeConfig<ChainSpec> {
     /// - `AUTH_PORT`: default + `instance` * 100 - 100
     /// - `HTTP_RPC_PORT`: default - `instance` + 1
     /// - `WS_RPC_PORT`: default + `instance` * 2 - 2
-    pub instance: u16,
+    /// - `IPC_PATH`: default + `instance`
+    pub instance: Option<u16>,
 
     /// All networking related arguments
     pub network: NetworkArgs,
@@ -133,6 +146,12 @@ pub struct NodeConfig<ChainSpec> {
 
     /// All pruning related arguments
     pub pruning: PruningArgs,
+
+    /// All engine related arguments
+    pub engine: EngineArgs,
+
+    /// All ERA import related arguments with --era prefix
+    pub era: EraArgs,
 }
 
 impl NodeConfig<ChainSpec> {
@@ -151,7 +170,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             config: None,
             chain,
             metrics: None,
-            instance: 1,
+            instance: None,
             network: NetworkArgs::default(),
             rpc: RpcServerArgs::default(),
             txpool: TxPoolArgs::default(),
@@ -161,6 +180,8 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             dev: DevArgs::default(),
             pruning: PruningArgs::default(),
             datadir: DatadirArgs::default(),
+            engine: EngineArgs::default(),
+            era: EraArgs::default(),
         }
     }
 
@@ -209,8 +230,13 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
 
     /// Set the instance for the node
     pub const fn with_instance(mut self, instance: u16) -> Self {
-        self.instance = instance;
+        self.instance = Some(instance);
         self
+    }
+
+    /// Returns the instance value, defaulting to 1 if not set.
+    pub fn get_instance(&self) -> u16 {
+        self.instance.unwrap_or(1)
     }
 
     /// Set the network args for the node
@@ -264,7 +290,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     /// Returns pruning configuration.
     pub fn prune_config(&self) -> Option<PruneConfig>
     where
-        ChainSpec: EthChainSpec,
+        ChainSpec: EthereumHardforks,
     {
         self.pruning.prune_config(&self.chain)
     }
@@ -310,7 +336,9 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
 
         let total_difficulty = provider
             .header_td_by_number(head)?
-            .expect("the total difficulty for the latest block is missing, database is corrupt");
+            // total difficulty is effectively deprecated, but still required in some places, e.g.
+            // p2p
+            .unwrap_or_default();
 
         let hash = provider
             .block_hash(head)?
@@ -382,8 +410,8 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     /// Change rpc port numbers based on the instance number, using the inner
     /// [`RpcServerArgs::adjust_instance_ports`] method.
     pub fn adjust_instance_ports(&mut self) {
-        self.rpc.adjust_instance_ports(self.instance);
         self.network.adjust_instance_ports(self.instance);
+        self.rpc.adjust_instance_ports(self.instance);
     }
 
     /// Sets networking and RPC ports to zero, causing the OS to choose random unused ports when
@@ -391,6 +419,15 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
     pub fn with_unused_ports(mut self) -> Self {
         self.rpc = self.rpc.with_unused_ports();
         self.network = self.network.with_unused_ports();
+        self
+    }
+
+    /// Effectively disables the RPC state cache by setting the cache sizes to `0`.
+    ///
+    /// By setting the cache sizes to 0, caching of newly executed or fetched blocks will be
+    /// effectively disabled.
+    pub const fn with_disabled_rpc_cache(mut self) -> Self {
+        self.rpc.rpc_state_cache.set_zero_lengths();
         self
     }
 
@@ -449,6 +486,8 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             db: self.db,
             dev: self.dev,
             pruning: self.pruning,
+            engine: self.engine,
+            era: self.era,
         }
     }
 }
@@ -475,6 +514,8 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
             dev: self.dev,
             pruning: self.pruning.clone(),
             datadir: self.datadir.clone(),
+            engine: self.engine.clone(),
+            era: self.era.clone(),
         }
     }
 }

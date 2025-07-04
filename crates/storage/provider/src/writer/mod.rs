@@ -4,14 +4,14 @@ use crate::{
     StorageLocation, TrieWriter,
 };
 use alloy_consensus::BlockHeader;
-use reth_chain_state::ExecutedBlock;
-use reth_db::transaction::{DbTx, DbTxMut};
-use reth_errors::ProviderResult;
-use reth_primitives::{NodePrimitives, StaticFileSegment};
-use reth_primitives_traits::SignedTransaction;
+use reth_chain_state::{ExecutedBlock, ExecutedBlockWithTrieUpdates};
+use reth_db_api::transaction::{DbTx, DbTxMut};
+use reth_errors::{ProviderError, ProviderResult};
+use reth_primitives_traits::{NodePrimitives, SignedTransaction};
+use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::{DBProvider, StageCheckpointWriter, TransactionsProviderExt};
 use reth_storage_errors::writer::UnifiedStorageWriterError;
-use revm::db::OriginalValuesKnown;
+use revm_database::OriginalValuesKnown;
 use std::sync::Arc;
 use tracing::debug;
 
@@ -62,7 +62,7 @@ impl<'a, ProviderDB, ProviderSF> UnifiedStorageWriter<'a, ProviderDB, ProviderSF
     ///
     /// # Panics
     /// If the static file instance is not set.
-    fn static_file(&self) -> &ProviderSF {
+    const fn static_file(&self) -> &ProviderSF {
         self.static_file.as_ref().expect("should exist")
     }
 
@@ -71,7 +71,7 @@ impl<'a, ProviderDB, ProviderSF> UnifiedStorageWriter<'a, ProviderDB, ProviderSF
     /// # Returns
     /// - `Ok(())` if the static file instance is set.
     /// - `Err(StorageWriterError::MissingStaticFileWriter)` if the static file instance is not set.
-    #[allow(unused)]
+    #[expect(unused)]
     const fn ensure_static_file(&self) -> Result<(), UnifiedStorageWriterError> {
         if self.static_file.is_none() {
             return Err(UnifiedStorageWriterError::MissingStaticFileWriter)
@@ -132,7 +132,7 @@ where
         + StaticFileProviderFactory,
 {
     /// Writes executed blocks and receipts to storage.
-    pub fn save_blocks<N>(&self, blocks: Vec<ExecutedBlock<N>>) -> ProviderResult<()>
+    pub fn save_blocks<N>(&self, blocks: Vec<ExecutedBlockWithTrieUpdates<N>>) -> ProviderResult<()>
     where
         N: NodePrimitives<SignedTx: SignedTransaction>,
         ProviderDB: BlockWriter<Block = N::Block> + StateWriter<Receipt = N::Receipt>,
@@ -143,9 +143,9 @@ where
         }
 
         // NOTE: checked non-empty above
-        let first_block = blocks.first().unwrap().block();
+        let first_block = blocks.first().unwrap().recovered_block();
 
-        let last_block = blocks.last().unwrap().block();
+        let last_block = blocks.last().unwrap().recovered_block();
         let first_number = first_block.number();
         let last_block_number = last_block.number();
 
@@ -160,11 +160,14 @@ where
         //  * trie updates (cannot naively extend, need helper)
         //  * indices (already done basically)
         // Insert the blocks
-        for ExecutedBlock { block, senders, execution_output, hashed_state, trie } in blocks {
-            let sealed_block = Arc::unwrap_or_clone(block)
-                .try_with_senders_unchecked(Arc::unwrap_or_clone(senders))
-                .unwrap();
-            self.database().insert_block(sealed_block, StorageLocation::Both)?;
+        for ExecutedBlockWithTrieUpdates {
+            block: ExecutedBlock { recovered_block, execution_output, hashed_state },
+            trie,
+        } in blocks
+        {
+            let block_hash = recovered_block.hash();
+            self.database()
+                .insert_block(Arc::unwrap_or_clone(recovered_block), StorageLocation::Both)?;
 
             // Write state and changesets to the database.
             // Must be written after blocks because of the receipt lookup.
@@ -177,7 +180,9 @@ where
             // insert hashes and intermediate merkle nodes
             self.database()
                 .write_hashed_state(&Arc::unwrap_or_clone(hashed_state).into_sorted())?;
-            self.database().write_trie_updates(&trie)?;
+            self.database().write_trie_updates(
+                trie.as_ref().ok_or(ProviderError::MissingTrieUpdates(block_hash))?,
+            )?;
         }
 
         // update history indices
@@ -226,31 +231,30 @@ mod tests {
         test_utils::create_test_provider_factory, AccountReader, StorageTrieWriter, TrieWriter,
     };
     use alloy_primitives::{keccak256, map::HashMap, Address, B256, U256};
-    use reth_db::tables;
     use reth_db_api::{
         cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO},
         models::{AccountBeforeTx, BlockNumberAddress},
+        tables,
         transaction::{DbTx, DbTxMut},
     };
+    use reth_ethereum_primitives::Receipt;
     use reth_execution_types::ExecutionOutcome;
-    use reth_primitives::{Account, Receipt, Receipts, StorageEntry};
+    use reth_primitives_traits::{Account, StorageEntry};
     use reth_storage_api::{DatabaseProviderFactory, HashedPostStateProvider};
     use reth_trie::{
         test_utils::{state_root, storage_root_prehashed},
         HashedPostState, HashedStorage, StateRoot, StorageRoot,
     };
     use reth_trie_db::{DatabaseStateRoot, DatabaseStorageRoot};
-    use revm::{
-        db::{
-            states::{
-                bundle_state::BundleRetention, changes::PlainStorageRevert, PlainStorageChangeset,
-            },
-            BundleState, EmptyDB,
+    use revm_database::{
+        states::{
+            bundle_state::BundleRetention, changes::PlainStorageRevert, PlainStorageChangeset,
         },
-        primitives::{
-            Account as RevmAccount, AccountInfo as RevmAccountInfo, AccountStatus, EvmStorageSlot,
-        },
-        DatabaseCommit, State,
+        BundleState, State,
+    };
+    use revm_database_interface::{DatabaseCommit, EmptyDB};
+    use revm_state::{
+        Account as RevmAccount, AccountInfo as RevmAccountInfo, AccountStatus, EvmStorageSlot,
     };
     use std::{collections::BTreeMap, str::FromStr};
 
@@ -332,6 +336,7 @@ mod tests {
                 info: account_a.clone(),
                 status: AccountStatus::Touched | AccountStatus::Created,
                 storage: HashMap::default(),
+                transaction_id: 0,
             },
         )]));
 
@@ -342,6 +347,7 @@ mod tests {
                 info: account_b_changed.clone(),
                 status: AccountStatus::Touched,
                 storage: HashMap::default(),
+                transaction_id: 0,
             },
         )]));
 
@@ -400,6 +406,7 @@ mod tests {
                 status: AccountStatus::Touched | AccountStatus::SelfDestructed,
                 info: account_b_changed,
                 storage: HashMap::default(),
+                transaction_id: 0,
             },
         )]));
 
@@ -474,6 +481,7 @@ mod tests {
                             EvmStorageSlot { present_value: U256::from(2), ..Default::default() },
                         ),
                     ]),
+                    transaction_id: 0,
                 },
             ),
             (
@@ -490,14 +498,14 @@ mod tests {
                             ..Default::default()
                         },
                     )]),
+                    transaction_id: 0,
                 },
             ),
         ]));
 
         state.merge_transitions(BundleRetention::Reverts);
 
-        let outcome =
-            ExecutionOutcome::new(state.take_bundle(), Receipts::default(), 1, Vec::new());
+        let outcome = ExecutionOutcome::new(state.take_bundle(), Default::default(), 1, Vec::new());
         provider
             .write_state(&outcome, OriginalValuesKnown::Yes, StorageLocation::Database)
             .expect("Could not write bundle state to DB");
@@ -592,12 +600,12 @@ mod tests {
                 status: AccountStatus::Touched | AccountStatus::SelfDestructed,
                 info: RevmAccountInfo::default(),
                 storage: HashMap::default(),
+                transaction_id: 0,
             },
         )]));
 
         state.merge_transitions(BundleRetention::Reverts);
-        let outcome =
-            ExecutionOutcome::new(state.take_bundle(), Receipts::default(), 2, Vec::new());
+        let outcome = ExecutionOutcome::new(state.take_bundle(), Default::default(), 2, Vec::new());
         provider
             .write_state(&outcome, OriginalValuesKnown::Yes, StorageLocation::Database)
             .expect("Could not write bundle state to DB");
@@ -659,12 +667,13 @@ mod tests {
                         EvmStorageSlot { present_value: U256::from(2), ..Default::default() },
                     ),
                 ]),
+                transaction_id: 0,
             },
         )]));
         init_state.merge_transitions(BundleRetention::Reverts);
 
         let outcome =
-            ExecutionOutcome::new(init_state.take_bundle(), Receipts::default(), 0, Vec::new());
+            ExecutionOutcome::new(init_state.take_bundle(), Default::default(), 0, Vec::new());
         provider
             .write_state(&outcome, OriginalValuesKnown::Yes, StorageLocation::Database)
             .expect("Could not write bundle state to DB");
@@ -691,6 +700,7 @@ mod tests {
                         ..Default::default()
                     },
                 )]),
+                transaction_id: 0,
             },
         )]));
         state.merge_transitions(BundleRetention::Reverts);
@@ -702,6 +712,7 @@ mod tests {
                 status: AccountStatus::Touched | AccountStatus::SelfDestructed,
                 info: account_info.clone(),
                 storage: HashMap::default(),
+                transaction_id: 0,
             },
         )]));
         state.merge_transitions(BundleRetention::Reverts);
@@ -713,6 +724,7 @@ mod tests {
                 status: AccountStatus::Touched | AccountStatus::Created,
                 info: account_info.clone(),
                 storage: HashMap::default(),
+                transaction_id: 0,
             },
         )]));
         state.merge_transitions(BundleRetention::Reverts);
@@ -740,6 +752,7 @@ mod tests {
                         EvmStorageSlot { present_value: U256::from(6), ..Default::default() },
                     ),
                 ]),
+                transaction_id: 0,
             },
         )]));
         state.merge_transitions(BundleRetention::Reverts);
@@ -751,6 +764,7 @@ mod tests {
                 status: AccountStatus::Touched | AccountStatus::SelfDestructed,
                 info: account_info.clone(),
                 storage: HashMap::default(),
+                transaction_id: 0,
             },
         )]));
         state.merge_transitions(BundleRetention::Reverts);
@@ -762,6 +776,7 @@ mod tests {
                 status: AccountStatus::Touched | AccountStatus::Created,
                 info: account_info.clone(),
                 storage: HashMap::default(),
+                transaction_id: 0,
             },
         )]));
         state.commit(HashMap::from_iter([(
@@ -774,6 +789,7 @@ mod tests {
                     U256::ZERO,
                     EvmStorageSlot { present_value: U256::from(2), ..Default::default() },
                 )]),
+                transaction_id: 0,
             },
         )]));
         state.commit(HashMap::from_iter([(
@@ -782,6 +798,7 @@ mod tests {
                 status: AccountStatus::Touched | AccountStatus::SelfDestructed,
                 info: account_info.clone(),
                 storage: HashMap::default(),
+                transaction_id: 0,
             },
         )]));
         state.commit(HashMap::from_iter([(
@@ -790,6 +807,7 @@ mod tests {
                 status: AccountStatus::Touched | AccountStatus::Created,
                 info: account_info.clone(),
                 storage: HashMap::default(),
+                transaction_id: 0,
             },
         )]));
         state.merge_transitions(BundleRetention::Reverts);
@@ -805,14 +823,16 @@ mod tests {
                     U256::ZERO,
                     EvmStorageSlot { present_value: U256::from(9), ..Default::default() },
                 )]),
+                transaction_id: 0,
             },
         )]));
+
         state.merge_transitions(BundleRetention::Reverts);
 
         let bundle = state.take_bundle();
 
         let outcome: ExecutionOutcome =
-            ExecutionOutcome::new(bundle, Receipts::default(), 1, Vec::new());
+            ExecutionOutcome::new(bundle, Default::default(), 1, Vec::new());
         provider
             .write_state(&outcome, OriginalValuesKnown::Yes, StorageLocation::Database)
             .expect("Could not write bundle state to DB");
@@ -973,11 +993,12 @@ mod tests {
                         EvmStorageSlot { present_value: U256::from(2), ..Default::default() },
                     ),
                 ]),
+                transaction_id: 0,
             },
         )]));
         init_state.merge_transitions(BundleRetention::Reverts);
         let outcome =
-            ExecutionOutcome::new(init_state.take_bundle(), Receipts::default(), 0, Vec::new());
+            ExecutionOutcome::new(init_state.take_bundle(), Default::default(), 0, Vec::new());
         provider
             .write_state(&outcome, OriginalValuesKnown::Yes, StorageLocation::Database)
             .expect("Could not write bundle state to DB");
@@ -996,6 +1017,7 @@ mod tests {
                 status: AccountStatus::Touched | AccountStatus::SelfDestructed,
                 info: account1.clone(),
                 storage: HashMap::default(),
+                transaction_id: 0,
             },
         )]));
 
@@ -1005,6 +1027,7 @@ mod tests {
                 status: AccountStatus::Touched | AccountStatus::Created,
                 info: account1.clone(),
                 storage: HashMap::default(),
+                transaction_id: 0,
             },
         )]));
 
@@ -1018,13 +1041,13 @@ mod tests {
                     U256::from(1),
                     EvmStorageSlot { present_value: U256::from(5), ..Default::default() },
                 )]),
+                transaction_id: 0,
             },
         )]));
 
         // Commit block #1 changes to the database.
         state.merge_transitions(BundleRetention::Reverts);
-        let outcome =
-            ExecutionOutcome::new(state.take_bundle(), Receipts::default(), 1, Vec::new());
+        let outcome = ExecutionOutcome::new(state.take_bundle(), Default::default(), 1, Vec::new());
         provider
             .write_state(&outcome, OriginalValuesKnown::Yes, StorageLocation::Database)
             .expect("Could not write bundle state to DB");
@@ -1057,7 +1080,7 @@ mod tests {
     fn revert_to_indices() {
         let base: ExecutionOutcome = ExecutionOutcome {
             bundle: BundleState::default(),
-            receipts: vec![vec![Some(Receipt::default()); 2]; 7].into(),
+            receipts: vec![vec![Receipt::default(); 2]; 7],
             first_block: 10,
             requests: Vec::new(),
         };
@@ -1145,6 +1168,7 @@ mod tests {
                 status: AccountStatus::Touched | AccountStatus::SelfDestructed,
                 info: RevmAccountInfo::default(),
                 storage: HashMap::default(),
+                transaction_id: 0,
             },
         )]));
         state.merge_transitions(BundleRetention::PlainState);
@@ -1171,8 +1195,13 @@ mod tests {
                 info: account2.0.into(),
                 storage: HashMap::from_iter([(
                     slot2,
-                    EvmStorageSlot::new_changed(account2_slot2_old_value, account2_slot2_new_value),
+                    EvmStorageSlot::new_changed(
+                        account2_slot2_old_value,
+                        account2_slot2_new_value,
+                        0,
+                    ),
                 )]),
+                transaction_id: 0,
             },
         )]));
         state.merge_transitions(BundleRetention::PlainState);
@@ -1190,6 +1219,7 @@ mod tests {
                 status: AccountStatus::Touched,
                 info: account3.0.into(),
                 storage: HashMap::default(),
+                transaction_id: 0,
             },
         )]));
         state.merge_transitions(BundleRetention::PlainState);
@@ -1207,6 +1237,7 @@ mod tests {
                 status: AccountStatus::Touched,
                 info: account4.0.into(),
                 storage: HashMap::default(),
+                transaction_id: 0,
             },
         )]));
         state.merge_transitions(BundleRetention::PlainState);
@@ -1222,6 +1253,7 @@ mod tests {
                 status: AccountStatus::Touched | AccountStatus::Created,
                 info: account1_new.into(),
                 storage: HashMap::default(),
+                transaction_id: 0,
             },
         )]));
         state.merge_transitions(BundleRetention::PlainState);
@@ -1239,8 +1271,9 @@ mod tests {
                 info: account1_new.into(),
                 storage: HashMap::from_iter([(
                     slot20,
-                    EvmStorageSlot::new_changed(U256::ZERO, account1_slot20_value),
+                    EvmStorageSlot::new_changed(U256::ZERO, account1_slot20_value, 0),
                 )]),
+                transaction_id: 0,
             },
         )]));
         state.merge_transitions(BundleRetention::PlainState);
@@ -1268,7 +1301,7 @@ mod tests {
 
         let mut test: ExecutionOutcome = ExecutionOutcome {
             bundle: present_state,
-            receipts: vec![vec![Some(Receipt::default()); 2]; 1].into(),
+            receipts: vec![vec![Receipt::default(); 2]; 1],
             first_block: 2,
             requests: Vec::new(),
         };

@@ -3,7 +3,7 @@ use crate::segments::{
     UserReceipts,
 };
 use alloy_eips::eip2718::Encodable2718;
-use reth_db::{table::Value, transaction::DbTxMut};
+use reth_db_api::{table::Value, transaction::DbTxMut};
 use reth_primitives_traits::NodePrimitives;
 use reth_provider::{
     providers::StaticFileProvider, BlockReader, DBProvider, PruneCheckpointWriter,
@@ -64,6 +64,7 @@ where
             receipts,
             account_history,
             storage_history,
+            bodies_history: _,
             receipts_log_filter,
         } = prune_modes;
 

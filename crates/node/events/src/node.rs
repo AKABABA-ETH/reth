@@ -250,7 +250,8 @@ impl NodeState {
                     }
                 }
             }
-            BeaconConsensusEngineEvent::CanonicalBlockAdded(block, elapsed) => {
+            BeaconConsensusEngineEvent::CanonicalBlockAdded(executed, elapsed) => {
+                let block = executed.sealed_block();
                 info!(
                     number=block.number(),
                     hash=?block.hash(),
@@ -258,6 +259,7 @@ impl NodeState {
                     txs=block.body().transactions().len(),
                     gas=%format_gas(block.gas_used()),
                     gas_throughput=%format_gas_throughput(block.gas_used(), elapsed),
+                    gas_limit=%format_gas(block.gas_limit()),
                     full=%format!("{:.1}%", block.gas_used() as f64 * 100.0 / block.gas_limit() as f64),
                     base_fee=%format!("{:.2}gwei", block.base_fee_per_gas().unwrap_or(0) as f64 / GWEI_TO_WEI as f64),
                     blobs=block.blob_gas_used().unwrap_or(0) / alloy_eips::eip4844::DATA_GAS_PER_BLOB,
@@ -272,8 +274,15 @@ impl NodeState {
 
                 info!(number=head.number(), hash=?head.hash(), ?elapsed, "Canonical chain committed");
             }
-            BeaconConsensusEngineEvent::ForkBlockAdded(block, elapsed) => {
+            BeaconConsensusEngineEvent::ForkBlockAdded(executed, elapsed) => {
+                let block = executed.sealed_block();
                 info!(number=block.number(), hash=?block.hash(), ?elapsed, "Block added to fork chain");
+            }
+            BeaconConsensusEngineEvent::InvalidBlock(block) => {
+                warn!(number=block.number(), hash=?block.hash(), "Encountered invalid block");
+            }
+            BeaconConsensusEngineEvent::BlockReceived(num_hash) => {
+                info!(number=num_hash.number, hash=?num_hash.hash, "Received block from consensus engine");
             }
         }
     }
@@ -284,16 +293,26 @@ impl NodeState {
         if self.current_stage.is_none() {
             match event {
                 ConsensusLayerHealthEvent::NeverSeen => {
-                    warn!("Post-merge network, but never seen beacon client. Please launch one to follow the chain!")
+                    warn!(
+                        "Post-merge network, but never seen beacon client. Please launch one to follow the chain!"
+                    )
                 }
                 ConsensusLayerHealthEvent::HasNotBeenSeenForAWhile(period) => {
-                    warn!(?period, "Post-merge network, but no beacon client seen for a while. Please launch one to follow the chain!")
+                    warn!(
+                        ?period,
+                        "Post-merge network, but no beacon client seen for a while. Please launch one to follow the chain!"
+                    )
                 }
                 ConsensusLayerHealthEvent::NeverReceivedUpdates => {
-                    warn!("Beacon client online, but never received consensus updates. Please ensure your beacon client is operational to follow the chain!")
+                    warn!(
+                        "Beacon client online, but never received consensus updates. Please ensure your beacon client is operational to follow the chain!"
+                    )
                 }
                 ConsensusLayerHealthEvent::HaveNotReceivedUpdatesForAWhile(period) => {
-                    warn!(?period, "Beacon client online, but no consensus updates received for a while. This may be because of a reth error, or an error in the beacon client! Please investigate reth and beacon client logs!")
+                    warn!(
+                        ?period,
+                        "Beacon client online, but no consensus updates received for a while. This may be because of a reth error, or an error in the beacon client! Please investigate reth and beacon client logs!"
+                    )
                 }
             }
         }

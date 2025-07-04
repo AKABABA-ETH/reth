@@ -107,6 +107,9 @@ pub enum SparseStateTrieErrorKind {
         /// Encoded first proof node.
         node: Bytes,
     },
+    /// Storage sparse trie error.
+    #[error("error in storage trie for address {0:?}: {1:?}")]
+    SparseStorageTrie(B256, SparseTrieErrorKind),
     /// Sparse trie error.
     #[error(transparent)]
     Sparse(#[from] SparseTrieErrorKind),
@@ -167,6 +170,12 @@ pub enum SparseTrieErrorKind {
     /// RLP error.
     #[error(transparent)]
     Rlp(#[from] alloy_rlp::Error),
+    /// Node not found in provider during revealing.
+    #[error("node {path:?} not found in provider during removal")]
+    NodeNotFoundInProvider {
+        /// Path to the missing node.
+        path: Nibbles,
+    },
     /// Other.
     #[error(transparent)]
     Other(#[from] Box<dyn core::error::Error + Send>),

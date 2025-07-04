@@ -1,11 +1,11 @@
 //! Internal errors for the tree module.
 
 use alloy_consensus::BlockHeader;
+use alloy_primitives::B256;
 use reth_consensus::ConsensusError;
 use reth_errors::{BlockExecutionError, BlockValidationError, ProviderError};
 use reth_evm::execute::InternalBlockExecutionError;
-use reth_primitives::SealedBlockFor;
-use reth_primitives_traits::{Block, BlockBody};
+use reth_primitives_traits::{Block, BlockBody, SealedBlock};
 use tokio::sync::oneshot::error::TryRecvError;
 
 /// This is an error that can come from advancing persistence. Either this can be a
@@ -18,6 +18,20 @@ pub enum AdvancePersistenceError {
     /// A provider error
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    /// Missing ancestor.
+    ///
+    /// This error occurs when we need to compute the state root for a block with missing trie
+    /// updates, but the ancestor block is not available. State root computation requires the state
+    /// from the parent block as a starting point.
+    ///
+    /// A block may be missing the trie updates when it's a fork chain block building on top of the
+    /// historical database state. Since we don't store the historical trie state, we cannot
+    /// generate the trie updates for it until the moment when database is unwound to the canonical
+    /// chain.
+    ///
+    /// Also see [`reth_chain_state::ExecutedTrieUpdates::Missing`].
+    #[error("Missing ancestor with hash {0}")]
+    MissingAncestor(B256),
 }
 
 #[derive(thiserror::Error)]
@@ -27,7 +41,7 @@ pub enum AdvancePersistenceError {
     .block.parent_hash(),
     .kind)]
 struct InsertBlockErrorData<B: Block> {
-    block: SealedBlockFor<B>,
+    block: SealedBlock<B>,
     #[source]
     kind: InsertBlockErrorKind,
 }
@@ -45,11 +59,11 @@ impl<B: Block> std::fmt::Debug for InsertBlockErrorData<B> {
 }
 
 impl<B: Block> InsertBlockErrorData<B> {
-    const fn new(block: SealedBlockFor<B>, kind: InsertBlockErrorKind) -> Self {
+    const fn new(block: SealedBlock<B>, kind: InsertBlockErrorKind) -> Self {
         Self { block, kind }
     }
 
-    fn boxed(block: SealedBlockFor<B>, kind: InsertBlockErrorKind) -> Box<Self> {
+    fn boxed(block: SealedBlock<B>, kind: InsertBlockErrorKind) -> Box<Self> {
         Box::new(Self::new(block, kind))
     }
 }
@@ -65,23 +79,18 @@ pub struct InsertBlockError<B: Block> {
 
 impl<B: Block> InsertBlockError<B> {
     /// Create a new `InsertInvalidBlockErrorTwo`
-    pub fn new(block: SealedBlockFor<B>, kind: InsertBlockErrorKind) -> Self {
+    pub fn new(block: SealedBlock<B>, kind: InsertBlockErrorKind) -> Self {
         Self { inner: InsertBlockErrorData::boxed(block, kind) }
     }
 
     /// Create a new `InsertInvalidBlockError` from a consensus error
-    pub fn consensus_error(error: ConsensusError, block: SealedBlockFor<B>) -> Self {
+    pub fn consensus_error(error: ConsensusError, block: SealedBlock<B>) -> Self {
         Self::new(block, InsertBlockErrorKind::Consensus(error))
-    }
-
-    /// Create a new `InsertInvalidBlockError` from a consensus error
-    pub fn sender_recovery_error(block: SealedBlockFor<B>) -> Self {
-        Self::new(block, InsertBlockErrorKind::SenderRecovery)
     }
 
     /// Consumes the error and returns the block that resulted in the error
     #[inline]
-    pub fn into_block(self) -> SealedBlockFor<B> {
+    pub fn into_block(self) -> SealedBlock<B> {
         self.inner.block
     }
 
@@ -93,13 +102,13 @@ impl<B: Block> InsertBlockError<B> {
 
     /// Returns the block that resulted in the error
     #[inline]
-    pub const fn block(&self) -> &SealedBlockFor<B> {
+    pub const fn block(&self) -> &SealedBlock<B> {
         &self.inner.block
     }
 
     /// Consumes the type and returns the block and error kind.
     #[inline]
-    pub fn split(self) -> (SealedBlockFor<B>, InsertBlockErrorKind) {
+    pub fn split(self) -> (SealedBlock<B>, InsertBlockErrorKind) {
         let inner = *self.inner;
         (inner.block, inner.kind)
     }
@@ -114,9 +123,6 @@ impl<B: Block> std::fmt::Debug for InsertBlockError<B> {
 /// All error variants possible when inserting a block
 #[derive(Debug, thiserror::Error)]
 pub enum InsertBlockErrorKind {
-    /// Failed to recover senders for the block
-    #[error("failed to recover senders for block")]
-    SenderRecovery,
     /// Block violated consensus rules.
     #[error(transparent)]
     Consensus(#[from] ConsensusError),
@@ -143,16 +149,12 @@ impl InsertBlockErrorKind {
         self,
     ) -> Result<InsertBlockValidationError, InsertBlockFatalError> {
         match self {
-            Self::SenderRecovery => Ok(InsertBlockValidationError::SenderRecovery),
             Self::Consensus(err) => Ok(InsertBlockValidationError::Consensus(err)),
             // other execution errors that are considered internal errors
             Self::Execution(err) => {
                 match err {
                     BlockExecutionError::Validation(err) => {
                         Ok(InsertBlockValidationError::Validation(err))
-                    }
-                    BlockExecutionError::Consensus(err) => {
-                        Ok(InsertBlockValidationError::Consensus(err))
                     }
                     // these are internal errors, not caused by an invalid block
                     BlockExecutionError::Internal(error) => {
@@ -180,20 +182,10 @@ pub enum InsertBlockFatalError {
 /// Error variants that are caused by invalid blocks
 #[derive(Debug, thiserror::Error)]
 pub enum InsertBlockValidationError {
-    /// Failed to recover senders for the block
-    #[error("failed to recover senders for block")]
-    SenderRecovery,
     /// Block violated consensus rules.
     #[error(transparent)]
     Consensus(#[from] ConsensusError),
     /// Validation error, transparently wrapping [`BlockValidationError`]
     #[error(transparent)]
     Validation(#[from] BlockValidationError),
-}
-
-impl InsertBlockValidationError {
-    /// Returns true if this is a block pre merge error.
-    pub const fn is_block_pre_merge(&self) -> bool {
-        matches!(self, Self::Validation(BlockValidationError::BlockPreMerge { .. }))
-    }
 }

@@ -53,8 +53,8 @@ pub enum NetworkError {
         error: io::Error,
     },
     /// IO error when creating the discovery service
-    #[error("failed to launch discovery service: {0}")]
-    Discovery(io::Error),
+    #[error("failed to launch discovery service on {0}: {1}")]
+    Discovery(SocketAddr, io::Error),
     /// An error occurred with discovery v5 node.
     #[error("discv5 error, {0}")]
     Discv5Error(#[from] reth_discv5::Error),
@@ -71,8 +71,8 @@ impl NetworkError {
         match err.kind() {
             ErrorKind::AddrInUse => Self::AddressAlreadyInUse { kind, error: err },
             _ => {
-                if let ServiceKind::Discovery(_) = kind {
-                    return Self::Discovery(err)
+                if let ServiceKind::Discovery(address) = kind {
+                    return Self::Discovery(address, err)
                 }
                 Self::Io(err)
             }
@@ -216,7 +216,7 @@ impl SessionError for PendingSessionHandshakeError {
                     ECIESErrorImpl::Secp256k1(_) |
                     ECIESErrorImpl::InvalidHandshake { .. }
             ),
-            Self::Timeout => false,
+            Self::Timeout | Self::UnsupportedExtraCapability => false,
         }
     }
 
@@ -235,6 +235,7 @@ impl SessionError for PendingSessionHandshakeError {
                     ECIESErrorImpl::InvalidHandshake { .. }
             ),
             Self::Timeout => false,
+            Self::UnsupportedExtraCapability => true,
         }
     }
 
@@ -243,6 +244,7 @@ impl SessionError for PendingSessionHandshakeError {
             Self::Eth(eth) => eth.should_backoff(),
             Self::Ecies(_) => Some(BackoffKind::Low),
             Self::Timeout => Some(BackoffKind::Medium),
+            Self::UnsupportedExtraCapability => Some(BackoffKind::High),
         }
     }
 }

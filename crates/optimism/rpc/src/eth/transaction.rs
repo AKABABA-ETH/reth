@@ -1,29 +1,33 @@
 //! Loads and formats OP transaction RPC response.
 
-use alloy_consensus::{Signed, Transaction as _};
-use alloy_primitives::{Bytes, PrimitiveSignature as Signature, Sealable, Sealed, B256};
-use alloy_rpc_types_eth::TransactionInfo;
-use op_alloy_consensus::{OpTxEnvelope, OpTypedTransaction};
-use op_alloy_rpc_types::{OpTransactionRequest, Transaction};
-use reth_node_api::FullNodeComponents;
-use reth_optimism_primitives::{OpReceipt, OpTransactionSigned};
-use reth_primitives::RecoveredTx;
-use reth_primitives_traits::transaction::signed::SignedTransaction;
-use reth_provider::{
-    BlockReader, BlockReaderIdExt, ProviderTx, ReceiptProvider, TransactionsProvider,
+use crate::{
+    eth::{OpEthApiInner, OpNodeCore},
+    OpEthApi, OpEthApiError, SequencerClient,
 };
+use alloy_primitives::{Bytes, B256};
+use alloy_rpc_types_eth::TransactionInfo;
+use op_alloy_consensus::{transaction::OpTransactionInfo, OpTxEnvelope};
+use reth_node_api::FullNodeComponents;
+use reth_optimism_primitives::DepositReceipt;
 use reth_rpc_eth_api::{
     helpers::{EthSigner, EthTransactions, LoadTransaction, SpawnBlocking},
-    FromEthApiError, FullEthApiTypes, RpcNodeCore, RpcNodeCoreExt, TransactionCompat,
+    try_into_op_tx_info, EthApiTypes, FromEthApiError, FullEthApiTypes, RpcNodeCore,
+    RpcNodeCoreExt, TxInfoMapper,
 };
-use reth_rpc_eth_types::{utils::recover_raw_transaction, EthApiError};
+use reth_rpc_eth_types::utils::recover_raw_transaction;
+use reth_storage_api::{
+    errors::ProviderError, BlockReader, BlockReaderIdExt, ProviderTx, ReceiptProvider,
+    TransactionsProvider,
+};
 use reth_transaction_pool::{PoolTransaction, TransactionOrigin, TransactionPool};
-
-use crate::{eth::OpNodeCore, OpEthApi, OpEthApiError, SequencerClient};
+use std::{
+    fmt::{Debug, Formatter},
+    sync::Arc,
+};
 
 impl<N> EthTransactions for OpEthApi<N>
 where
-    Self: LoadTransaction<Provider: BlockReaderIdExt>,
+    Self: LoadTransaction<Provider: BlockReaderIdExt> + EthApiTypes<Error = OpEthApiError>,
     N: OpNodeCore<Provider: BlockReader<Transaction = ProviderTx<Self::Provider>>>,
 {
     fn signers(&self) -> &parking_lot::RwLock<Vec<Box<dyn EthSigner<ProviderTx<Self::Provider>>>>> {
@@ -41,9 +45,19 @@ where
         // blocks that it builds.
         if let Some(client) = self.raw_tx_forwarder().as_ref() {
             tracing::debug!(target: "rpc::eth", hash = %pool_transaction.hash(), "forwarding raw transaction to sequencer");
-            let _ = client.forward_raw_transaction(&tx).await.inspect_err(|err| {
+            let hash = client.forward_raw_transaction(&tx).await.inspect_err(|err| {
                     tracing::debug!(target: "rpc::eth", %err, hash=% *pool_transaction.hash(), "failed to forward raw transaction");
-                });
+                })?;
+
+            // Retain tx in local tx pool after forwarding, for local RPC usage.
+            let _ = self
+                .pool()
+                .add_transaction(TransactionOrigin::Local, pool_transaction)
+                .await.inspect_err(|err| {
+                    tracing::warn!(target: "rpc::eth", %err, %hash, "successfully sent tx to sequencer, but failed to persist in local tx pool");
+            });
+
+            return Ok(hash)
         }
 
         // submit the transaction to the pool with a `Local` origin
@@ -75,110 +89,39 @@ where
     }
 }
 
-impl<N> TransactionCompat<OpTransactionSigned> for OpEthApi<N>
+/// Optimism implementation of [`TxInfoMapper`].
+///
+/// For deposits, receipt is fetched to extract `deposit_nonce` and `deposit_receipt_version`.
+/// Otherwise, it works like regular Ethereum implementation, i.e. uses [`TransactionInfo`].
+#[derive(Clone)]
+pub struct OpTxInfoMapper<N: OpNodeCore>(Arc<OpEthApiInner<N>>);
+
+impl<N: OpNodeCore> Debug for OpTxInfoMapper<N> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpTxInfoMapper").finish()
+    }
+}
+
+impl<N: OpNodeCore> OpTxInfoMapper<N> {
+    /// Creates [`OpTxInfoMapper`] that uses [`ReceiptProvider`] borrowed from given `eth_api`.
+    pub const fn new(eth_api: Arc<OpEthApiInner<N>>) -> Self {
+        Self(eth_api)
+    }
+}
+
+impl<N> TxInfoMapper<&OpTxEnvelope> for OpTxInfoMapper<N>
 where
-    N: FullNodeComponents<Provider: ReceiptProvider<Receipt = OpReceipt>>,
+    N: FullNodeComponents,
+    N::Provider: ReceiptProvider<Receipt: DepositReceipt>,
 {
-    type Transaction = Transaction;
-    type Error = OpEthApiError;
+    type Out = OpTransactionInfo;
+    type Err = ProviderError;
 
-    fn fill(
+    fn try_map(
         &self,
-        tx: RecoveredTx<OpTransactionSigned>,
+        tx: &OpTxEnvelope,
         tx_info: TransactionInfo,
-    ) -> Result<Self::Transaction, Self::Error> {
-        let from = tx.signer();
-        let hash = *tx.tx_hash();
-        let OpTransactionSigned { transaction, signature, .. } = tx.into_tx();
-        let mut deposit_receipt_version = None;
-        let mut deposit_nonce = None;
-
-        let inner = match transaction {
-            OpTypedTransaction::Legacy(tx) => Signed::new_unchecked(tx, signature, hash).into(),
-            OpTypedTransaction::Eip2930(tx) => Signed::new_unchecked(tx, signature, hash).into(),
-            OpTypedTransaction::Eip1559(tx) => Signed::new_unchecked(tx, signature, hash).into(),
-            OpTypedTransaction::Eip7702(tx) => Signed::new_unchecked(tx, signature, hash).into(),
-            OpTypedTransaction::Deposit(tx) => {
-                self.inner
-                    .eth_api
-                    .provider()
-                    .receipt_by_hash(hash)
-                    .map_err(Self::Error::from_eth_err)?
-                    .inspect(|receipt| {
-                        if let OpReceipt::Deposit(receipt) = receipt {
-                            deposit_receipt_version = receipt.deposit_receipt_version;
-                            deposit_nonce = receipt.deposit_nonce;
-                        }
-                    });
-
-                OpTxEnvelope::Deposit(tx.seal_unchecked(hash))
-            }
-        };
-
-        let TransactionInfo {
-            block_hash, block_number, index: transaction_index, base_fee, ..
-        } = tx_info;
-
-        let effective_gas_price = if inner.is_deposit() {
-            // For deposits, we must always set the `gasPrice` field to 0 in rpc
-            // deposit tx don't have a gas price field, but serde of `Transaction` will take care of
-            // it
-            0
-        } else {
-            base_fee
-                .map(|base_fee| {
-                    inner.effective_tip_per_gas(base_fee as u64).unwrap_or_default() + base_fee
-                })
-                .unwrap_or_else(|| inner.max_fee_per_gas())
-        };
-
-        Ok(Transaction {
-            inner: alloy_rpc_types_eth::Transaction {
-                inner,
-                block_hash,
-                block_number,
-                transaction_index,
-                from,
-                effective_gas_price: Some(effective_gas_price),
-            },
-            deposit_nonce,
-            deposit_receipt_version,
-        })
-    }
-
-    fn build_simulate_v1_transaction(
-        &self,
-        request: alloy_rpc_types_eth::TransactionRequest,
-    ) -> Result<OpTransactionSigned, Self::Error> {
-        let request: OpTransactionRequest = request.into();
-        let Ok(tx) = request.build_typed_tx() else {
-            return Err(OpEthApiError::Eth(EthApiError::TransactionConversionError))
-        };
-
-        // Create an empty signature for the transaction.
-        let signature = Signature::new(Default::default(), Default::default(), false);
-        Ok(OpTransactionSigned::new_unhashed(tx, signature))
-    }
-
-    fn otterscan_api_truncate_input(tx: &mut Self::Transaction) {
-        let input = match &mut tx.inner.inner {
-            OpTxEnvelope::Eip1559(tx) => &mut tx.tx_mut().input,
-            OpTxEnvelope::Eip2930(tx) => &mut tx.tx_mut().input,
-            OpTxEnvelope::Legacy(tx) => &mut tx.tx_mut().input,
-            OpTxEnvelope::Eip7702(tx) => &mut tx.tx_mut().input,
-            OpTxEnvelope::Deposit(tx) => {
-                let (mut deposit, hash) = std::mem::replace(
-                    tx,
-                    Sealed::new_unchecked(Default::default(), Default::default()),
-                )
-                .split();
-                deposit.input = deposit.input.slice(..4);
-                let mut deposit = deposit.seal_unchecked(hash);
-                std::mem::swap(tx, &mut deposit);
-                return
-            }
-            _ => return,
-        };
-        *input = input.slice(..4);
+    ) -> Result<Self::Out, ProviderError> {
+        try_into_op_tx_info(self.0.eth_api.provider(), tx, tx_info)
     }
 }

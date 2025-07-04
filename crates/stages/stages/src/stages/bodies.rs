@@ -1,11 +1,11 @@
 use super::missing_static_data_error;
 use futures_util::TryStreamExt;
-use reth_codecs::Compact;
-use reth_db::{tables, transaction::DbTx};
-use reth_db_api::{cursor::DbCursorRO, transaction::DbTxMut};
+use reth_db_api::{
+    cursor::DbCursorRO,
+    tables,
+    transaction::{DbTx, DbTxMut},
+};
 use reth_network_p2p::bodies::{downloader::BodyDownloader, response::BlockResponse};
-use reth_primitives::StaticFileSegment;
-use reth_primitives_traits::{Block, BlockBody, BlockHeader};
 use reth_provider::{
     providers::StaticFileWriter, BlockReader, BlockWriter, DBProvider, ProviderError,
     StaticFileProviderFactory, StatsReader, StorageLocation,
@@ -14,6 +14,7 @@ use reth_stages_api::{
     EntitiesCheckpoint, ExecInput, ExecOutput, Stage, StageCheckpoint, StageError, StageId,
     UnwindInput, UnwindOutput,
 };
+use reth_static_file_types::StaticFileSegment;
 use reth_storage_errors::provider::ProviderResult;
 use std::{
     cmp::Ordering,
@@ -38,25 +39,25 @@ use tracing::*;
 ///
 /// The bodies are processed and data is inserted into these tables:
 ///
-/// - [`BlockOmmers`][reth_db::tables::BlockOmmers]
-/// - [`BlockBodies`][reth_db::tables::BlockBodyIndices]
-/// - [`Transactions`][reth_db::tables::Transactions]
-/// - [`TransactionBlocks`][reth_db::tables::TransactionBlocks]
+/// - [`BlockOmmers`][reth_db_api::tables::BlockOmmers]
+/// - [`BlockBodies`][reth_db_api::tables::BlockBodyIndices]
+/// - [`Transactions`][reth_db_api::tables::Transactions]
+/// - [`TransactionBlocks`][reth_db_api::tables::TransactionBlocks]
 ///
 /// # Genesis
 ///
 /// This stage expects that the genesis has been inserted into the appropriate tables:
 ///
 /// - The header tables (see [`HeaderStage`][crate::stages::HeaderStage])
-/// - The [`BlockOmmers`][reth_db::tables::BlockOmmers] table
-/// - The [`BlockBodies`][reth_db::tables::BlockBodyIndices] table
-/// - The [`Transactions`][reth_db::tables::Transactions] table
+/// - The [`BlockOmmers`][reth_db_api::tables::BlockOmmers] table
+/// - The [`BlockBodies`][reth_db_api::tables::BlockBodyIndices] table
+/// - The [`Transactions`][reth_db_api::tables::Transactions] table
 #[derive(Debug)]
 pub struct BodyStage<D: BodyDownloader> {
     /// The body downloader.
     downloader: D,
     /// Block response buffer.
-    buffer: Option<Vec<BlockResponse<D::Header, D::Body>>>,
+    buffer: Option<Vec<BlockResponse<D::Block>>>,
 }
 
 impl<D: BodyDownloader> BodyStage<D> {
@@ -64,71 +65,61 @@ impl<D: BodyDownloader> BodyStage<D> {
     pub const fn new(downloader: D) -> Self {
         Self { downloader, buffer: None }
     }
+}
 
-    /// Ensures that static files and database are in sync.
-    fn ensure_consistency<Provider>(
-        &self,
-        provider: &Provider,
-        unwind_block: Option<u64>,
-    ) -> Result<(), StageError>
-    where
-        Provider: DBProvider<Tx: DbTxMut> + BlockReader + StaticFileProviderFactory,
-    {
-        // Get id for the next tx_num of zero if there are no transactions.
-        let next_tx_num = provider
-            .tx_ref()
-            .cursor_read::<tables::TransactionBlocks>()?
-            .last()?
-            .map(|(id, _)| id + 1)
-            .unwrap_or_default();
+/// Ensures that static files and database are in sync.
+pub(crate) fn ensure_consistency<Provider>(
+    provider: &Provider,
+    unwind_block: Option<u64>,
+) -> Result<(), StageError>
+where
+    Provider: DBProvider<Tx: DbTxMut> + BlockReader + StaticFileProviderFactory,
+{
+    // Get id for the next tx_num of zero if there are no transactions.
+    let next_tx_num = provider
+        .tx_ref()
+        .cursor_read::<tables::TransactionBlocks>()?
+        .last()?
+        .map(|(id, _)| id + 1)
+        .unwrap_or_default();
 
-        let static_file_provider = provider.static_file_provider();
+    let static_file_provider = provider.static_file_provider();
 
-        // Make sure Transactions static file is at the same height. If it's further, this
-        // input execution was interrupted previously and we need to unwind the static file.
-        let next_static_file_tx_num = static_file_provider
-            .get_highest_static_file_tx(StaticFileSegment::Transactions)
-            .map(|id| id + 1)
-            .unwrap_or_default();
+    // Make sure Transactions static file is at the same height. If it's further, this
+    // input execution was interrupted previously and we need to unwind the static file.
+    let next_static_file_tx_num = static_file_provider
+        .get_highest_static_file_tx(StaticFileSegment::Transactions)
+        .map(|id| id + 1)
+        .unwrap_or_default();
 
-        match next_static_file_tx_num.cmp(&next_tx_num) {
-            // If static files are ahead, we are currently unwinding the stage or we didn't reach
-            // the database commit in a previous stage run. So, our only solution is to unwind the
-            // static files and proceed from the database expected height.
-            Ordering::Greater => {
-                let highest_db_block =
-                    provider.tx_ref().entries::<tables::BlockBodyIndices>()? as u64;
-                let mut static_file_producer =
-                    static_file_provider.latest_writer(StaticFileSegment::Transactions)?;
-                static_file_producer
-                    .prune_transactions(next_static_file_tx_num - next_tx_num, highest_db_block)?;
-                // Since this is a database <-> static file inconsistency, we commit the change
-                // straight away.
-                static_file_producer.commit()?;
-            }
-            // If static files are behind, then there was some corruption or loss of files. This
-            // error will trigger an unwind, that will bring the database to the same height as the
-            // static files.
-            Ordering::Less => {
-                // If we are already in the process of unwind, this might be fine because we will
-                // fix the inconsistency right away.
-                if let Some(unwind_to) = unwind_block {
-                    let next_tx_num_after_unwind = provider
-                        .tx_ref()
-                        .get::<tables::BlockBodyIndices>(unwind_to)?
-                        .map(|b| b.next_tx_num())
-                        .ok_or(ProviderError::BlockBodyIndicesNotFound(unwind_to))?;
+    match next_static_file_tx_num.cmp(&next_tx_num) {
+        // If static files are ahead, we are currently unwinding the stage or we didn't reach
+        // the database commit in a previous stage run. So, our only solution is to unwind the
+        // static files and proceed from the database expected height.
+        Ordering::Greater => {
+            let highest_db_block = provider.tx_ref().entries::<tables::BlockBodyIndices>()? as u64;
+            let mut static_file_producer =
+                static_file_provider.latest_writer(StaticFileSegment::Transactions)?;
+            static_file_producer
+                .prune_transactions(next_static_file_tx_num - next_tx_num, highest_db_block)?;
+            // Since this is a database <-> static file inconsistency, we commit the change
+            // straight away.
+            static_file_producer.commit()?;
+        }
+        // If static files are behind, then there was some corruption or loss of files. This
+        // error will trigger an unwind, that will bring the database to the same height as the
+        // static files.
+        Ordering::Less => {
+            // If we are already in the process of unwind, this might be fine because we will
+            // fix the inconsistency right away.
+            if let Some(unwind_to) = unwind_block {
+                let next_tx_num_after_unwind = provider
+                    .block_body_indices(unwind_to)?
+                    .map(|b| b.next_tx_num())
+                    .ok_or(ProviderError::BlockBodyIndicesNotFound(unwind_to))?;
 
-                    // This means we need a deeper unwind.
-                    if next_tx_num_after_unwind > next_static_file_tx_num {
-                        return Err(missing_static_data_error(
-                            next_static_file_tx_num.saturating_sub(1),
-                            &static_file_provider,
-                            provider,
-                            StaticFileSegment::Transactions,
-                        )?)
-                    }
-                } else {
+                // This means we need a deeper unwind.
+                if next_tx_num_after_unwind > next_static_file_tx_num {
                     return Err(missing_static_data_error(
                         next_static_file_tx_num.saturating_sub(1),
                         &static_file_provider,
@@ -136,12 +127,19 @@ impl<D: BodyDownloader> BodyStage<D> {
                         StaticFileSegment::Transactions,
                     )?)
                 }
+            } else {
+                return Err(missing_static_data_error(
+                    next_static_file_tx_num.saturating_sub(1),
+                    &static_file_provider,
+                    provider,
+                    StaticFileSegment::Transactions,
+                )?)
             }
-            Ordering::Equal => {}
         }
-
-        Ok(())
+        Ordering::Equal => {}
     }
+
+    Ok(())
 }
 
 impl<Provider, D> Stage<Provider> for BodyStage<D>
@@ -150,8 +148,8 @@ where
         + StaticFileProviderFactory
         + StatsReader
         + BlockReader
-        + BlockWriter<Block: Block<Header = D::Header, Body = D::Body>>,
-    D: BodyDownloader<Header: BlockHeader, Body: BlockBody<Transaction: Compact>>,
+        + BlockWriter<Block = D::Block>,
+    D: BodyDownloader,
 {
     /// Return the id of the stage
     fn id(&self) -> StageId {
@@ -194,7 +192,7 @@ where
         }
         let (from_block, to_block) = input.next_block_range().into_inner();
 
-        self.ensure_consistency(provider, None)?;
+        ensure_consistency(provider, None)?;
 
         debug!(target: "sync::stages::bodies", stage_progress = from_block, target = to_block, "Commencing sync");
 
@@ -231,7 +229,7 @@ where
     ) -> Result<UnwindOutput, StageError> {
         self.buffer.take();
 
-        self.ensure_consistency(provider, Some(input.unwind_to))?;
+        ensure_consistency(provider, Some(input.unwind_to))?;
         provider.remove_bodies_above(input.unwind_to, StorageLocation::Both)?;
 
         Ok(UnwindOutput {
@@ -309,7 +307,7 @@ mod tests {
         assert!(runner.validate_execution(input, output.ok()).is_ok(), "execution validation");
     }
 
-    /// Same as [partial_body_download] except the `batch_size` is not hit.
+    /// Same as [`partial_body_download`] except the `batch_size` is not hit.
     #[tokio::test]
     async fn full_body_download() {
         let (stage_progress, previous_stage) = (1, 20);
@@ -348,7 +346,7 @@ mod tests {
         assert!(runner.validate_execution(input, output.ok()).is_ok(), "execution validation");
     }
 
-    /// Same as [full_body_download] except we have made progress before
+    /// Same as [`full_body_download`] except we have made progress before
     #[tokio::test]
     async fn sync_from_previous_progress() {
         let (stage_progress, previous_stage) = (1, 21);
@@ -491,6 +489,7 @@ mod tests {
             models::{StoredBlockBodyIndices, StoredBlockOmmers},
             transaction::{DbTx, DbTxMut},
         };
+        use reth_ethereum_primitives::{Block, BlockBody};
         use reth_network_p2p::{
             bodies::{
                 downloader::{BodyDownloader, BodyDownloaderResult},
@@ -498,12 +497,13 @@ mod tests {
             },
             error::DownloadResult,
         };
-        use reth_primitives::{BlockBody, SealedBlock, SealedHeader, StaticFileSegment};
+        use reth_primitives_traits::{SealedBlock, SealedHeader};
         use reth_provider::{
             providers::StaticFileWriter, test_utils::MockNodeTypesWithDB, HeaderProvider,
             ProviderFactory, StaticFileProviderFactory, TransactionsProvider,
         };
         use reth_stages_api::{ExecInput, ExecOutput, UnwindInput};
+        use reth_static_file_types::StaticFileSegment;
         use reth_testing_utils::generators::{
             self, random_block_range, random_signed_tx, BlockRangeParams,
         };
@@ -518,7 +518,7 @@ mod tests {
         pub(crate) const GENESIS_HASH: B256 = B256::ZERO;
 
         /// A helper to create a collection of block bodies keyed by their hash.
-        pub(crate) fn body_by_hash(block: &SealedBlock) -> (B256, BlockBody) {
+        pub(crate) fn body_by_hash(block: &SealedBlock<Block>) -> (B256, BlockBody) {
             (block.hash(), block.body().clone())
         }
 
@@ -562,7 +562,7 @@ mod tests {
         }
 
         impl ExecuteStageTestRunner for BodyTestRunner {
-            type Seed = Vec<SealedBlock>;
+            type Seed = Vec<SealedBlock<Block>>;
 
             fn seed_execution(&mut self, input: ExecInput) -> Result<Self::Seed, TestRunnerError> {
                 let start = input.checkpoint().block_number;
@@ -762,8 +762,7 @@ mod tests {
         }
 
         impl BodyDownloader for TestBodyDownloader {
-            type Header = Header;
-            type Body = BlockBody;
+            type Block = Block;
 
             fn set_download_range(
                 &mut self,
@@ -785,7 +784,7 @@ mod tests {
         }
 
         impl Stream for TestBodyDownloader {
-            type Item = BodyDownloaderResult<Header, BlockBody>;
+            type Item = BodyDownloaderResult<Block>;
             fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
                 let this = self.get_mut();
 
@@ -801,7 +800,9 @@ mod tests {
                     } else {
                         let body =
                             this.responses.remove(&header.hash()).expect("requested unknown body");
-                        response.push(BlockResponse::Full(SealedBlock::new(header, body)));
+                        response.push(BlockResponse::Full(SealedBlock::from_sealed_parts(
+                            header, body,
+                        )));
                     }
 
                     if response.len() as u64 >= this.batch_size {

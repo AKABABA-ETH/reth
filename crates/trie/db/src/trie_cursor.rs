@@ -1,13 +1,10 @@
 use alloy_primitives::B256;
-use reth_db::{
-    cursor::{DbCursorRW, DbDupCursorRW},
-    tables,
-};
 use reth_db_api::{
-    cursor::{DbCursorRO, DbDupCursorRO},
+    cursor::{DbCursorRO, DbCursorRW, DbDupCursorRO, DbDupCursorRW},
+    tables,
     transaction::DbTx,
+    DatabaseError,
 };
-use reth_storage_errors::db::DatabaseError;
 use reth_trie::{
     trie_cursor::{TrieCursor, TrieCursorFactory},
     updates::StorageTrieUpdates,
@@ -143,7 +140,7 @@ where
         let mut num_entries = 0;
         for (nibbles, maybe_updated) in storage_updates.into_iter().filter(|(n, _)| !n.is_empty()) {
             num_entries += 1;
-            let nibbles = StoredNibblesSubKey(nibbles.clone());
+            let nibbles = StoredNibblesSubKey(*nibbles);
             // Delete the old entry if it exists.
             if self
                 .cursor
@@ -178,7 +175,7 @@ where
     ) -> Result<Option<(Nibbles, BranchNodeCompact)>, DatabaseError> {
         Ok(self
             .cursor
-            .seek_by_key_subkey(self.hashed_address, StoredNibblesSubKey(key.clone()))?
+            .seek_by_key_subkey(self.hashed_address, StoredNibblesSubKey(key))?
             .filter(|e| e.nibbles == StoredNibblesSubKey(key))
             .map(|value| (value.nibbles.0, value.node)))
     }

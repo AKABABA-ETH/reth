@@ -3,7 +3,7 @@ use alloy_genesis::Genesis;
 use alloy_primitives::{b256, hex};
 use futures::StreamExt;
 use reth_chainspec::ChainSpec;
-use reth_node_api::{FullNodeComponents, FullNodePrimitives, NodeTypes};
+use reth_node_api::{BlockBody, FullNodeComponents, FullNodePrimitives, NodeTypes};
 use reth_node_builder::{
     rpc::RethRpcAddOns, EngineNodeLauncher, FullNode, NodeBuilder, NodeConfig, NodeHandle,
 };
@@ -52,20 +52,22 @@ where
     let mut notifications = node.provider.canonical_state_stream();
 
     // submit tx through rpc
-    let raw_tx = hex!("02f876820a28808477359400847735940082520894ab0840c0e43688012c1adb0f5e3fc665188f83d28a029d394a5d630544000080c080a0a044076b7e67b5deecc63f61a8d7913fab86ca365b344b5759d1fe3563b4c39ea019eab979dd000da04dfc72bb0377c092d30fd9e1cab5ae487de49586cc8b0090");
+    let raw_tx = hex!(
+        "02f876820a28808477359400847735940082520894ab0840c0e43688012c1adb0f5e3fc665188f83d28a029d394a5d630544000080c080a0a044076b7e67b5deecc63f61a8d7913fab86ca365b344b5759d1fe3563b4c39ea019eab979dd000da04dfc72bb0377c092d30fd9e1cab5ae487de49586cc8b0090"
+    );
 
     let eth_api = node.rpc_registry.eth_api();
 
     let hash = eth_api.send_raw_transaction(raw_tx.into()).await.unwrap();
 
-    let expected = b256!("b1c6512f4fc202c04355fbda66755e0e344b152e633010e8fd75ecec09b63398");
+    let expected = b256!("0xb1c6512f4fc202c04355fbda66755e0e344b152e633010e8fd75ecec09b63398");
 
     assert_eq!(hash, expected);
     println!("submitted transaction: {hash}");
 
     let head = notifications.next().await.unwrap();
 
-    let tx = &head.tip().transactions()[0];
+    let tx = &head.tip().body().transactions()[0];
     assert_eq!(tx.trie_hash(), hash);
     println!("mined transaction: {hash}");
 }

@@ -25,6 +25,7 @@ pub async fn setup(num_nodes: usize) -> eyre::Result<(Vec<OpNode>, TaskManager, 
         num_nodes,
         Arc::new(OpChainSpecBuilder::base_mainnet().genesis(genesis).ecotone_activated().build()),
         false,
+        Default::default(),
         optimism_payload_attributes,
     )
     .await
@@ -35,7 +36,7 @@ pub async fn advance_chain(
     length: usize,
     node: &mut OpNode,
     wallet: Arc<Mutex<Wallet>>,
-) -> eyre::Result<Vec<(OpBuiltPayload, OpPayloadBuilderAttributes)>> {
+) -> eyre::Result<Vec<OpBuiltPayload>> {
     node.advance(length as u64, |_| {
         let wallet = wallet.clone();
         Box::pin(async move {
@@ -53,7 +54,7 @@ pub async fn advance_chain(
 }
 
 /// Helper function to create a new eth payload attributes
-pub fn optimism_payload_attributes(timestamp: u64) -> OpPayloadBuilderAttributes {
+pub fn optimism_payload_attributes<T>(timestamp: u64) -> OpPayloadBuilderAttributes<T> {
     let attributes = PayloadAttributes {
         timestamp,
         prev_randao: B256::ZERO,

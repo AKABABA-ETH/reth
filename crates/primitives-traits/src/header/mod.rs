@@ -1,8 +1,5 @@
 mod sealed;
-pub use sealed::{Header, SealedHeader};
-
-mod error;
-pub use error::HeaderError;
+pub use sealed::{Header, SealedHeader, SealedHeaderFor};
 
 #[cfg(any(test, feature = "test-utils", feature = "arbitrary"))]
 pub mod test_utils;

@@ -1,5 +1,6 @@
 //! Command that initializes the node from a genesis file.
 
+use alloy_consensus::Header;
 use clap::Parser;
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_commands::common::{AccessRights, CliNodeTypes, Environment};
@@ -9,12 +10,12 @@ use reth_optimism_primitives::{
     bedrock::{BEDROCK_HEADER, BEDROCK_HEADER_HASH, BEDROCK_HEADER_TTD},
     OpPrimitives,
 };
-use reth_primitives::SealedHeader;
+use reth_primitives_traits::SealedHeader;
 use reth_provider::{
     BlockNumReader, ChainSpecProvider, DatabaseProviderFactory, StaticFileProviderFactory,
     StaticFileWriter,
 };
-use std::io::BufReader;
+use std::{io::BufReader, sync::Arc};
 use tracing::info;
 
 /// Initializes the database with the genesis block.
@@ -58,10 +59,11 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> InitStateCommandOp<C> {
                     &provider_rw,
                     SealedHeader::new(BEDROCK_HEADER, BEDROCK_HEADER_HASH),
                     BEDROCK_HEADER_TTD,
+                    |number| Header { number, ..Default::default() },
                 )?;
 
                 // SAFETY: it's safe to commit static files, since in the event of a crash, they
-                // will be unwinded according to database checkpoints.
+                // will be unwound according to database checkpoints.
                 //
                 // Necessary to commit, so the BEDROCK_HEADER is accessible to provider_rw and
                 // init_state_dump
@@ -82,5 +84,12 @@ impl<C: ChainSpecParser<ChainSpec = OpChainSpec>> InitStateCommandOp<C> {
 
         info!(target: "reth::cli", hash = ?hash, "Genesis block written");
         Ok(())
+    }
+}
+
+impl<C: ChainSpecParser> InitStateCommandOp<C> {
+    /// Returns the underlying chain being used to run this command
+    pub fn chain_spec(&self) -> Option<&Arc<C::ChainSpec>> {
+        self.init_state.chain_spec()
     }
 }
