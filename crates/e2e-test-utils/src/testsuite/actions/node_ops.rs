@@ -4,6 +4,7 @@ use crate::testsuite::{Action, Environment};
 use alloy_rpc_types_eth::{Block, Header, Receipt, Transaction, TransactionRequest};
 use eyre::Result;
 use futures_util::future::BoxFuture;
+use reth_ethereum_primitives::TransactionSigned;
 use reth_node_api::EngineTypes;
 use reth_rpc_api::clients::EthApiClient;
 use std::time::Duration;
@@ -74,18 +75,28 @@ where
             let node_b_client = &env.node_clients[self.node_b];
 
             // Get latest block from each node
-            let block_a = EthApiClient::<TransactionRequest, Transaction, Block, Receipt, Header>::block_by_number(
-                &node_a_client.rpc,
-                alloy_eips::BlockNumberOrTag::Latest,
-                false,
+            let block_a = EthApiClient::<
+                TransactionRequest,
+                Transaction,
+                Block,
+                Receipt,
+                Header,
+                TransactionSigned,
+            >::block_by_number(
+                &node_a_client.rpc, alloy_eips::BlockNumberOrTag::Latest, false
             )
             .await?
             .ok_or_else(|| eyre::eyre!("Failed to get latest block from node {}", self.node_a))?;
 
-            let block_b = EthApiClient::<TransactionRequest, Transaction, Block, Receipt, Header>::block_by_number(
-                &node_b_client.rpc,
-                alloy_eips::BlockNumberOrTag::Latest,
-                false,
+            let block_b = EthApiClient::<
+                TransactionRequest,
+                Transaction,
+                Block,
+                Receipt,
+                Header,
+                TransactionSigned,
+            >::block_by_number(
+                &node_b_client.rpc, alloy_eips::BlockNumberOrTag::Latest, false
             )
             .await?
             .ok_or_else(|| eyre::eyre!("Failed to get latest block from node {}", self.node_b))?;
@@ -195,15 +206,15 @@ where
                 .copied()
                 .ok_or_else(|| eyre::eyre!("Block tag '{}' not found in registry", self.tag))?;
 
-            if let Some(expected_node) = self.expected_node_idx {
-                if node_idx != expected_node {
-                    return Err(eyre::eyre!(
-                        "Block tag '{}' came from node {} but expected node {}",
-                        self.tag,
-                        node_idx,
-                        expected_node
-                    ));
-                }
+            if let Some(expected_node) = self.expected_node_idx &&
+                node_idx != expected_node
+            {
+                return Err(eyre::eyre!(
+                    "Block tag '{}' came from node {} but expected node {}",
+                    self.tag,
+                    node_idx,
+                    expected_node
+                ));
             }
 
             debug!(
@@ -278,6 +289,7 @@ where
                         Block,
                         Receipt,
                         Header,
+                        TransactionSigned,
                     >::block_by_number(
                         &node_a_client.rpc,
                         alloy_eips::BlockNumberOrTag::Latest,
@@ -294,6 +306,7 @@ where
                         Block,
                         Receipt,
                         Header,
+                        TransactionSigned,
                     >::block_by_number(
                         &node_b_client.rpc,
                         alloy_eips::BlockNumberOrTag::Latest,
@@ -335,6 +348,48 @@ where
                     self.timeout_secs
                 )),
             }
+        })
+    }
+}
+
+/// Action to assert the current chain tip is at a specific block number.
+#[derive(Debug)]
+pub struct AssertChainTip {
+    /// Expected block number
+    pub expected_block_number: u64,
+}
+
+impl AssertChainTip {
+    /// Create a new `AssertChainTip` action
+    pub const fn new(expected_block_number: u64) -> Self {
+        Self { expected_block_number }
+    }
+}
+
+impl<Engine> Action<Engine> for AssertChainTip
+where
+    Engine: EngineTypes,
+{
+    fn execute<'a>(&'a mut self, env: &'a mut Environment<Engine>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let current_block = env
+                .current_block_info()
+                .ok_or_else(|| eyre::eyre!("No current block information available"))?;
+
+            if current_block.number != self.expected_block_number {
+                return Err(eyre::eyre!(
+                    "Expected chain tip to be at block {}, but found block {}",
+                    self.expected_block_number,
+                    current_block.number
+                ));
+            }
+
+            debug!(
+                "Chain tip verified at block {} (hash: {})",
+                current_block.number, current_block.hash
+            );
+
+            Ok(())
         })
     }
 }

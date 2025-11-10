@@ -43,13 +43,11 @@ jsonrpsee-types.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-parking_lot.workspace = true
 
 [dev-dependencies]
 reth-ethereum-engine-primitives.workspace = true
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-ethereum-primitives.workspace = true
-reth-primitives-traits.workspace = true
 reth-payload-builder = { workspace = true, features = ["test-utils"] }
 reth-testing-utils.workspace = true
 alloy-rlp.workspace = true

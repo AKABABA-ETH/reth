@@ -161,6 +161,7 @@ impl<N: NetworkPrimitives> NetworkState<N> {
             peer,
             status.blockhash,
             block_number,
+            Arc::clone(&capabilities),
             timeout,
             range_info,
         );
@@ -497,7 +498,7 @@ impl<N: NetworkPrimitives> NetworkState<N> {
                 self.on_peer_action(action);
             }
 
-            // We need to poll again tn case we have received any responses because they may have
+            // We need to poll again in case we have received any responses because they may have
             // triggered follow-up requests.
             if self.queued_messages.is_empty() {
                 return Poll::Pending

@@ -105,13 +105,13 @@ impl ExecInput {
             // get tx block number. next_tx_num in this case will be less than all_tx_cnt.
             // So we are sure that transaction must exist.
             let end_block_number = provider
-                .transaction_block(first_tx_num + tx_threshold)?
+                .block_by_transaction_id(first_tx_num + tx_threshold)?
                 .expect("block of tx must exist");
             // we want to get range of all transactions of this block, so we are fetching block
             // body.
             let end_block_body = provider
                 .block_body_indices(end_block_number)?
-                .ok_or(ProviderError::BlockBodyIndicesNotFound(target_block))?;
+                .ok_or(ProviderError::BlockBodyIndicesNotFound(end_block_number))?;
             (end_block_number, false, end_block_body.next_tx_num())
         };
 

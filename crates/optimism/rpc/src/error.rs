@@ -11,7 +11,7 @@ use reth_rpc_eth_api::{AsEthApiError, EthTxEnvError, TransactionConversionError}
 use reth_rpc_eth_types::{error::api::FromEvmHalt, EthApiError};
 use reth_rpc_server_types::result::{internal_rpc_err, rpc_err};
 use revm::context_interface::result::{EVMError, InvalidTransaction};
-use std::fmt::Display;
+use std::{convert::Infallible, fmt::Display};
 
 /// Optimism specific errors, that extend [`EthApiError`].
 #[derive(Debug, thiserror::Error)]
@@ -67,6 +67,9 @@ pub enum OpInvalidTransactionError {
     /// A deposit transaction halted post-regolith
     #[error("deposit transaction halted after regolith")]
     HaltedDepositPostRegolith,
+    /// The encoded transaction was missing during evm execution.
+    #[error("missing enveloped transaction bytes")]
+    MissingEnvelopedTx,
     /// Transaction conditional errors.
     #[error(transparent)]
     TxConditionalErr(#[from] TxConditionalErr),
@@ -76,7 +79,8 @@ impl From<OpInvalidTransactionError> for jsonrpsee_types::error::ErrorObject<'st
     fn from(err: OpInvalidTransactionError) -> Self {
         match err {
             OpInvalidTransactionError::DepositSystemTxPostRegolith |
-            OpInvalidTransactionError::HaltedDepositPostRegolith => {
+            OpInvalidTransactionError::HaltedDepositPostRegolith |
+            OpInvalidTransactionError::MissingEnvelopedTx => {
                 rpc_err(EthRpcErrorCode::TransactionRejected.code(), err.to_string(), None)
             }
             OpInvalidTransactionError::TxConditionalErr(_) => err.into(),
@@ -93,6 +97,7 @@ impl TryFrom<OpTransactionError> for OpInvalidTransactionError {
                 Ok(Self::DepositSystemTxPostRegolith)
             }
             OpTransactionError::HaltedDepositPostRegolith => Ok(Self::HaltedDepositPostRegolith),
+            OpTransactionError::MissingEnvelopedTx => Ok(Self::MissingEnvelopedTx),
             OpTransactionError::Base(err) => Err(err),
         }
     }
@@ -210,5 +215,11 @@ impl From<ProviderError> for OpEthApiError {
 impl From<BlockError> for OpEthApiError {
     fn from(value: BlockError) -> Self {
         Self::Eth(EthApiError::from(value))
+    }
+}
+
+impl From<Infallible> for OpEthApiError {
+    fn from(value: Infallible) -> Self {
+        match value {}
     }
 }

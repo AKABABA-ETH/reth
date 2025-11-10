@@ -38,6 +38,7 @@ reth-trie-db = { workspace = true, optional = true }
 reth-node-builder = { workspace = true, optional = true }
 reth-tasks = { workspace = true, optional = true }
 reth-cli-util = { workspace = true, optional = true }
+reth-engine-local = { workspace = true, optional = true }
 
 # reth-ethereum
 reth-ethereum-primitives.workspace = true
@@ -123,11 +124,14 @@ node = [
     "provider",
     "consensus",
     "evm",
+    "network",
     "node-api",
     "dep:reth-node-ethereum",
     "dep:reth-node-builder",
+    "dep:reth-engine-local",
     "rpc",
     "trie-db",
+    "pool",
 ]
 pool = ["dep:reth-transaction-pool"]
 rpc = [
@@ -140,7 +144,13 @@ rpc = [
     "dep:alloy-rpc-types-engine",
 ]
 tasks = ["dep:reth-tasks"]
-js-tracer = ["rpc", "reth-rpc/js-tracer"]
+js-tracer = [
+    "rpc",
+    "reth-rpc/js-tracer",
+    "reth-node-builder?/js-tracer",
+    "reth-node-ethereum?/js-tracer",
+    "reth-rpc-eth-types?/js-tracer",
+]
 network = ["dep:reth-network", "tasks", "dep:reth-network-api", "dep:reth-eth-wire"]
 provider = ["storage-api", "tasks", "dep:reth-provider", "dep:reth-db", "dep:reth-codecs"]
 storage-api = ["dep:reth-storage-api"]

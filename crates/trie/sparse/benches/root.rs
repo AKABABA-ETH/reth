@@ -5,15 +5,15 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use itertools::Itertools;
 use proptest::{prelude::*, strategy::ValueTree, test_runner::TestRunner};
 use reth_trie::{
-    hashed_cursor::{noop::NoopHashedStorageCursor, HashedPostStateStorageCursor},
+    hashed_cursor::{noop::NoopHashedCursor, HashedPostStateCursor},
     node_iter::{TrieElement, TrieNodeIter},
-    trie_cursor::{noop::NoopStorageTrieCursor, InMemoryStorageTrieCursor},
+    trie_cursor::{noop::NoopStorageTrieCursor, InMemoryTrieCursor},
     updates::StorageTrieUpdates,
     walker::TrieWalker,
     HashedStorage,
 };
 use reth_trie_common::{HashBuilder, Nibbles};
-use reth_trie_sparse::{blinded::DefaultBlindedProvider, RevealedSparseTrie, SparseTrie};
+use reth_trie_sparse::{provider::DefaultTrieNodeProvider, SerialSparseTrie, SparseTrie};
 
 fn calculate_root_from_leaves(c: &mut Criterion) {
     let mut group = c.benchmark_group("calculate root from leaves");
@@ -40,9 +40,9 @@ fn calculate_root_from_leaves(c: &mut Criterion) {
         });
 
         // sparse trie
-        let provider = DefaultBlindedProvider;
+        let provider = DefaultTrieNodeProvider;
         group.bench_function(BenchmarkId::new("sparse trie", size), |b| {
-            b.iter_with_setup(SparseTrie::<RevealedSparseTrie>::revealed_empty, |mut sparse| {
+            b.iter_with_setup(SparseTrie::<SerialSparseTrie>::revealed_empty, |mut sparse| {
                 for (key, value) in &state {
                     sparse
                         .update_leaf(
@@ -133,19 +133,18 @@ fn calculate_root_from_leaves_repeated(c: &mut Criterion) {
                                         )
                                     };
 
-                                let walker = TrieWalker::storage_trie(
-                                    InMemoryStorageTrieCursor::new(
-                                        B256::ZERO,
-                                        NoopStorageTrieCursor::default(),
-                                        Some(&trie_updates_sorted),
+                                let walker = TrieWalker::<_>::storage_trie(
+                                    InMemoryTrieCursor::new(
+                                        Some(NoopStorageTrieCursor::default()),
+                                        &trie_updates_sorted.storage_nodes,
                                     ),
                                     prefix_set,
                                 );
                                 let mut node_iter = TrieNodeIter::storage_trie(
                                     walker,
-                                    HashedPostStateStorageCursor::new(
-                                        NoopHashedStorageCursor::default(),
-                                        Some(&storage_sorted),
+                                    HashedPostStateCursor::new(
+                                        Option::<NoopHashedCursor<U256>>::None,
+                                        &storage_sorted.storage_slots,
                                     ),
                                 );
 
@@ -179,7 +178,7 @@ fn calculate_root_from_leaves_repeated(c: &mut Criterion) {
                 });
 
                 // sparse trie
-                let provider = DefaultBlindedProvider;
+                let provider = DefaultTrieNodeProvider;
                 let benchmark_id = BenchmarkId::new(
                     "sparse trie",
                     format!(
@@ -189,7 +188,7 @@ fn calculate_root_from_leaves_repeated(c: &mut Criterion) {
                 group.bench_function(benchmark_id, |b| {
                     b.iter_with_setup(
                         || {
-                            let mut sparse = SparseTrie::<RevealedSparseTrie>::revealed_empty();
+                            let mut sparse = SparseTrie::<SerialSparseTrie>::revealed_empty();
                             for (key, value) in &init_state {
                                 sparse
                                     .update_leaf(

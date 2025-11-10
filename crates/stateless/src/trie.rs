@@ -9,8 +9,8 @@ use reth_errors::ProviderError;
 use reth_revm::state::Bytecode;
 use reth_trie_common::{HashedPostState, Nibbles, TRIE_ACCOUNT_RLP_MAX_SIZE};
 use reth_trie_sparse::{
-    blinded::{DefaultBlindedProvider, DefaultBlindedProviderFactory},
     errors::SparseStateTrieResult,
+    provider::{DefaultTrieNodeProvider, DefaultTrieNodeProviderFactory},
     SparseStateTrie, SparseTrie, SparseTrieInterface,
 };
 
@@ -167,15 +167,15 @@ impl StatelessTrie for StatelessSparseTrie {
 /// The bytecode has a separate mapping because the [`SparseStateTrie`] does not store the
 /// contract bytecode, only the hash of it (code hash).
 ///
-/// If the roots do not match, it returns `None`, indicating the witness is invalid
-/// for the given `pre_state_root`.
+/// If the roots do not match, it returns an error indicating the witness is invalid
+/// for the given `pre_state_root` (see `StatelessValidationError::PreStateRootMismatch`).
 // Note: This approach might be inefficient for ZKVMs requiring minimal memory operations, which
 // would explain why they have for the most part re-implemented this function.
 fn verify_execution_witness(
     witness: &ExecutionWitness,
     pre_state_root: B256,
 ) -> Result<(SparseStateTrie, B256Map<Bytecode>), StatelessValidationError> {
-    let provider_factory = DefaultBlindedProviderFactory;
+    let provider_factory = DefaultTrieNodeProviderFactory;
     let mut trie = SparseStateTrie::new();
     let mut state_witness = B256Map::default();
     let mut bytecode = B256Map::default();
@@ -237,10 +237,10 @@ fn calculate_state_root(
     // borrowing issues.
     let mut storage_results = Vec::with_capacity(state.storages.len());
 
-    // In `verify_execution_witness` a `DefaultBlindedProviderFactory` is used, so we use the same
+    // In `verify_execution_witness` a `DefaultTrieNodeProviderFactory` is used, so we use the same
     // again in here.
-    let provider_factory = DefaultBlindedProviderFactory;
-    let storage_provider = DefaultBlindedProvider;
+    let provider_factory = DefaultTrieNodeProviderFactory;
+    let storage_provider = DefaultTrieNodeProvider;
 
     for (address, storage) in state.storages.into_iter().sorted_unstable_by_key(|(addr, _)| *addr) {
         // Take the existing storage trie (or create an empty, “revealed” one)
@@ -286,7 +286,6 @@ fn calculate_state_root(
         state.accounts.into_iter().sorted_unstable_by_key(|(addr, _)| *addr)
     {
         let nibbles = Nibbles::unpack(hashed_address);
-        let account = account.unwrap_or_default();
 
         // Determine which storage root should be used for this account
         let storage_root = if let Some(storage_trie) = trie.storage_trie_mut(&hashed_address) {
@@ -298,12 +297,12 @@ fn calculate_state_root(
         };
 
         // Decide whether to remove or update the account leaf
-        if account.is_empty() && storage_root == EMPTY_ROOT_HASH {
-            trie.remove_account_leaf(&nibbles, &provider_factory)?;
-        } else {
+        if let Some(account) = account {
             account_rlp_buf.clear();
             account.into_trie_account(storage_root).encode(&mut account_rlp_buf);
             trie.update_account_leaf(nibbles, account_rlp_buf.clone(), &provider_factory)?;
+        } else {
+            trie.remove_account_leaf(&nibbles, &provider_factory)?;
         }
     }
 

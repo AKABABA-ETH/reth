@@ -7,9 +7,10 @@ use alloy_evm::{call::CallError, overrides::StateOverrideError};
 use alloy_primitives::{Address, Bytes, B256, U256};
 use alloy_rpc_types_eth::{error::EthRpcErrorCode, request::TransactionInputError, BlockError};
 use alloy_sol_types::{ContractError, RevertReason};
+use alloy_transport::{RpcError, TransportErrorKind};
 pub use api::{AsEthApiError, FromEthApiError, FromEvmError, IntoEthApiError};
 use core::time::Duration;
-use reth_errors::{BlockExecutionError, RethError};
+use reth_errors::{BlockExecutionError, BlockValidationError, RethError};
 use reth_primitives_traits::transaction::{error::InvalidTransactionError, signed::RecoveryError};
 use reth_rpc_convert::{CallFeesError, EthTxEnvError, TransactionConversionError};
 use reth_rpc_server_types::result::{
@@ -24,7 +25,7 @@ use revm::context_interface::result::{
 };
 use revm_inspectors::tracing::MuxError;
 use std::convert::Infallible;
-use tracing::error;
+use tokio::sync::oneshot::error::RecvError;
 
 /// A trait to convert an error to an RPC error.
 pub trait ToRpcError: core::error::Error + Send + Sync + 'static {
@@ -35,6 +36,19 @@ pub trait ToRpcError: core::error::Error + Send + Sync + 'static {
 impl ToRpcError for jsonrpsee_types::ErrorObject<'static> {
     fn to_rpc_error(&self) -> jsonrpsee_types::ErrorObject<'static> {
         self.clone()
+    }
+}
+
+impl ToRpcError for RpcError<TransportErrorKind> {
+    fn to_rpc_error(&self) -> jsonrpsee_types::ErrorObject<'static> {
+        match self {
+            Self::ErrorResp(payload) => jsonrpsee_types::error::ErrorObject::owned(
+                payload.code as i32,
+                payload.message.clone(),
+                payload.data.clone(),
+            ),
+            err => internal_rpc_err(err.to_string()),
+        }
     }
 }
 
@@ -55,7 +69,7 @@ pub enum EthApiError {
     InvalidTransactionSignature,
     /// Errors related to the transaction pool
     #[error(transparent)]
-    PoolError(RpcPoolError),
+    PoolError(#[from] RpcPoolError),
     /// Header not found for block hash/number/tag
     #[error("header not found")]
     HeaderNotFound(BlockId),
@@ -166,6 +180,22 @@ pub enum EthApiError {
         /// Duration that was waited before timing out
         duration: Duration,
     },
+    /// Error thrown when batch tx response channel fails
+    #[error(transparent)]
+    BatchTxRecvError(#[from] RecvError),
+    /// Error thrown when batch tx send channel fails
+    #[error("Batch transaction sender channel closed")]
+    BatchTxSendError,
+    /// Error that occurred during `call_many` execution with bundle and transaction context
+    #[error("call_many error in bundle {bundle_index} and transaction {tx_index}: {}", .error.message())]
+    CallManyError {
+        /// Bundle index where the error occurred
+        bundle_index: usize,
+        /// Transaction index within the bundle where the error occurred  
+        tx_index: usize,
+        /// The underlying error object
+        error: jsonrpsee_types::ErrorObject<'static>,
+    },
     /// Any other error
     #[error("{0}")]
     Other(Box<dyn ToRpcError>),
@@ -177,14 +207,37 @@ impl EthApiError {
         Self::Other(Box::new(err))
     }
 
+    /// Creates a new [`EthApiError::CallManyError`] variant.
+    pub const fn call_many_error(
+        bundle_index: usize,
+        tx_index: usize,
+        error: jsonrpsee_types::ErrorObject<'static>,
+    ) -> Self {
+        Self::CallManyError { bundle_index, tx_index, error }
+    }
+
     /// Returns `true` if error is [`RpcInvalidTransactionError::GasTooHigh`]
     pub const fn is_gas_too_high(&self) -> bool {
-        matches!(self, Self::InvalidTransaction(RpcInvalidTransactionError::GasTooHigh))
+        matches!(
+            self,
+            Self::InvalidTransaction(
+                RpcInvalidTransactionError::GasTooHigh |
+                    RpcInvalidTransactionError::GasLimitTooHigh
+            )
+        )
     }
 
     /// Returns `true` if error is [`RpcInvalidTransactionError::GasTooLow`]
     pub const fn is_gas_too_low(&self) -> bool {
         matches!(self, Self::InvalidTransaction(RpcInvalidTransactionError::GasTooLow))
+    }
+
+    /// Returns the [`RpcInvalidTransactionError`] if this is a [`EthApiError::InvalidTransaction`]
+    pub const fn as_invalid_transaction(&self) -> Option<&RpcInvalidTransactionError> {
+        match self {
+            Self::InvalidTransaction(e) => Some(e),
+            _ => None,
+        }
     }
 
     /// Converts the given [`StateOverrideError`] into a new [`EthApiError`] instance.
@@ -201,6 +254,11 @@ impl EthApiError {
         E: Into<Self>,
     {
         err.into()
+    }
+
+    /// Converts this error into the rpc error object.
+    pub fn into_rpc_err(self) -> jsonrpsee_types::error::ErrorObject<'static> {
+        self.into()
     }
 }
 
@@ -229,18 +287,12 @@ impl From<EthApiError> for jsonrpsee_types::error::ErrorObject<'static> {
             EthApiError::UnknownBlockOrTxIndex | EthApiError::TransactionNotFound => {
                 rpc_error_with_code(EthRpcErrorCode::ResourceNotFound.code(), error.to_string())
             }
-            // TODO(onbjerg): We rewrite the error message here because op-node does string matching
-            // on the error message.
-            //
-            // Until https://github.com/ethereum-optimism/optimism/pull/11759 is released, this must be kept around.
-            EthApiError::HeaderNotFound(id) => rpc_error_with_code(
-                EthRpcErrorCode::ResourceNotFound.code(),
-                format!("block not found: {}", block_id_to_str(id)),
-            ),
-            EthApiError::ReceiptsNotFound(id) => rpc_error_with_code(
-                EthRpcErrorCode::ResourceNotFound.code(),
-                format!("{error}: {}", block_id_to_str(id)),
-            ),
+            EthApiError::HeaderNotFound(id) | EthApiError::ReceiptsNotFound(id) => {
+                rpc_error_with_code(
+                    EthRpcErrorCode::ResourceNotFound.code(),
+                    format!("block not found: {}", block_id_to_str(id)),
+                )
+            }
             EthApiError::HeaderRangeNotFound(start_id, end_id) => rpc_error_with_code(
                 EthRpcErrorCode::ResourceNotFound.code(),
                 format!(
@@ -249,9 +301,10 @@ impl From<EthApiError> for jsonrpsee_types::error::ErrorObject<'static> {
                     block_id_to_str(end_id),
                 ),
             ),
-            err @ EthApiError::TransactionConfirmationTimeout { .. } => {
-                rpc_error_with_code(EthRpcErrorCode::TransactionRejected.code(), err.to_string())
-            }
+            err @ EthApiError::TransactionConfirmationTimeout { .. } => rpc_error_with_code(
+                EthRpcErrorCode::TransactionConfirmationTimeout.code(),
+                err.to_string(),
+            ),
             EthApiError::Unsupported(msg) => internal_rpc_err(msg),
             EthApiError::InternalJsTracerError(msg) => internal_rpc_err(msg),
             EthApiError::InvalidParams(msg) => invalid_params_rpc_err(msg),
@@ -266,6 +319,20 @@ impl From<EthApiError> for jsonrpsee_types::error::ErrorObject<'static> {
             EthApiError::PrunedHistoryUnavailable => rpc_error_with_code(4444, error.to_string()),
             EthApiError::Other(err) => err.to_rpc_error(),
             EthApiError::MuxTracerError(msg) => internal_rpc_err(msg.to_string()),
+            EthApiError::BatchTxRecvError(err) => internal_rpc_err(err.to_string()),
+            EthApiError::BatchTxSendError => {
+                internal_rpc_err("Batch transaction sender channel closed".to_string())
+            }
+            EthApiError::CallManyError { bundle_index, tx_index, error } => {
+                jsonrpsee_types::error::ErrorObject::owned(
+                    error.code(),
+                    format!(
+                        "call_many error in bundle {bundle_index} and transaction {tx_index}: {}",
+                        error.message()
+                    ),
+                    error.data(),
+                )
+            }
         }
     }
 }
@@ -358,7 +425,30 @@ impl From<RethError> for EthApiError {
 
 impl From<BlockExecutionError> for EthApiError {
     fn from(error: BlockExecutionError) -> Self {
-        Self::Internal(error.into())
+        match error {
+            BlockExecutionError::Validation(validation_error) => match validation_error {
+                BlockValidationError::InvalidTx { error, .. } => {
+                    if let Some(invalid_tx) = error.as_invalid_tx_err() {
+                        Self::InvalidTransaction(RpcInvalidTransactionError::from(
+                            invalid_tx.clone(),
+                        ))
+                    } else {
+                        Self::InvalidTransaction(RpcInvalidTransactionError::other(
+                            rpc_error_with_code(
+                                EthRpcErrorCode::TransactionRejected.code(),
+                                error.to_string(),
+                            ),
+                        ))
+                    }
+                }
+                _ => Self::Internal(RethError::Execution(BlockExecutionError::Validation(
+                    validation_error,
+                ))),
+            },
+            BlockExecutionError::Internal(internal_error) => {
+                Self::Internal(RethError::Execution(BlockExecutionError::Internal(internal_error)))
+            }
+        }
     }
 }
 
@@ -372,7 +462,6 @@ impl From<reth_errors::ProviderError> for EthApiError {
             }
             ProviderError::BestBlockNotFound => Self::HeaderNotFound(BlockId::latest()),
             ProviderError::BlockNumberForTransactionIndexNotFound => Self::UnknownBlockOrTxIndex,
-            ProviderError::TotalDifficultyNotFound(num) => Self::HeaderNotFound(num.into()),
             ProviderError::FinalizedBlockNotFound => Self::HeaderNotFound(BlockId::finalized()),
             ProviderError::SafeBlockNotFound => Self::HeaderNotFound(BlockId::safe()),
             err => Self::Internal(err.into()),
@@ -389,18 +478,32 @@ impl From<InvalidHeader> for EthApiError {
     }
 }
 
-impl<T> From<EVMError<T, InvalidTransaction>> for EthApiError
+impl<T, TxError> From<EVMError<T, TxError>> for EthApiError
 where
     T: Into<Self>,
+    TxError: reth_evm::InvalidTxError,
 {
-    fn from(err: EVMError<T, InvalidTransaction>) -> Self {
+    fn from(err: EVMError<T, TxError>) -> Self {
         match err {
-            EVMError::Transaction(invalid_tx) => match invalid_tx {
-                InvalidTransaction::NonceTooLow { tx, state } => {
-                    Self::InvalidTransaction(RpcInvalidTransactionError::NonceTooLow { tx, state })
+            EVMError::Transaction(invalid_tx) => {
+                // Try to get the underlying InvalidTransaction if available
+                if let Some(eth_tx_err) = invalid_tx.as_invalid_tx_err() {
+                    // Handle the special NonceTooLow case
+                    match eth_tx_err {
+                        InvalidTransaction::NonceTooLow { tx, state } => {
+                            Self::InvalidTransaction(RpcInvalidTransactionError::NonceTooLow {
+                                tx: *tx,
+                                state: *state,
+                            })
+                        }
+                        _ => RpcInvalidTransactionError::from(eth_tx_err.clone()).into(),
+                    }
+                } else {
+                    // For custom transaction errors that don't wrap InvalidTransaction,
+                    // convert to a custom error message
+                    Self::EvmCustom(invalid_tx.to_string())
                 }
-                _ => RpcInvalidTransactionError::from(invalid_tx).into(),
-            },
+            }
             EVMError::Header(err) => err.into(),
             EVMError::Database(err) => err.into(),
             EVMError::Custom(err) => Self::EvmCustom(err),
@@ -516,6 +619,9 @@ pub enum RpcInvalidTransactionError {
     /// Contains the gas limit.
     #[error("out of gas: gas exhausted during memory expansion: {0}")]
     MemoryOutOfGas(u64),
+    /// Memory limit was exceeded during memory expansion.
+    #[error("out of memory: memory limit exceeded during memory expansion")]
+    MemoryLimitOutOfGas,
     /// Gas limit was exceeded during precompile execution.
     /// Contains the gas limit.
     #[error("out of gas: gas exhausted during precompiled contract execution: {0}")]
@@ -586,9 +692,7 @@ impl RpcInvalidTransactionError {
     pub fn other<E: ToRpcError>(err: E) -> Self {
         Self::Other(Box::new(err))
     }
-}
 
-impl RpcInvalidTransactionError {
     /// Returns the rpc error code for this error.
     pub const fn error_code(&self) -> i32 {
         match self {
@@ -608,7 +712,7 @@ impl RpcInvalidTransactionError {
     /// Converts the halt error
     ///
     /// Takes the configured gas limit of the transaction which is attached to the error
-    pub const fn halt(reason: HaltReason, gas_limit: u64) -> Self {
+    pub fn halt(reason: HaltReason, gas_limit: u64) -> Self {
         match reason {
             HaltReason::OutOfGas(err) => Self::out_of_gas(err, gas_limit),
             HaltReason::NonceOverflow => Self::NonceMaxValue,
@@ -622,10 +726,16 @@ impl RpcInvalidTransactionError {
             OutOfGasError::Basic | OutOfGasError::ReentrancySentry => {
                 Self::BasicOutOfGas(gas_limit)
             }
-            OutOfGasError::Memory | OutOfGasError::MemoryLimit => Self::MemoryOutOfGas(gas_limit),
+            OutOfGasError::Memory => Self::MemoryOutOfGas(gas_limit),
+            OutOfGasError::MemoryLimit => Self::MemoryLimitOutOfGas,
             OutOfGasError::Precompile => Self::PrecompileOutOfGas(gas_limit),
             OutOfGasError::InvalidOperand => Self::InvalidOperandOutOfGas(gas_limit),
         }
+    }
+
+    /// Converts this error into the rpc error object.
+    pub fn into_rpc_err(self) -> jsonrpsee_types::error::ErrorObject<'static> {
+        self.into()
     }
 }
 
@@ -684,7 +794,7 @@ impl From<InvalidTransaction> for RpcInvalidTransactionError {
             InvalidTransaction::BlobVersionedHashesNotSupported => {
                 Self::BlobVersionedHashesNotSupported
             }
-            InvalidTransaction::BlobGasPriceGreaterThanMax => Self::BlobFeeCapTooLow,
+            InvalidTransaction::BlobGasPriceGreaterThanMax { .. } => Self::BlobFeeCapTooLow,
             InvalidTransaction::EmptyBlobs => Self::BlobTransactionMissingBlobHashes,
             InvalidTransaction::BlobVersionNotSupported => Self::BlobHashVersionMismatch,
             InvalidTransaction::TooManyBlobs { have, .. } => Self::TooManyBlobs { have },
@@ -702,6 +812,7 @@ impl From<InvalidTransaction> for RpcInvalidTransactionError {
             InvalidTransaction::Eip7873MissingTarget => {
                 Self::other(internal_rpc_err(err.to_string()))
             }
+            InvalidTransaction::Str(_) => Self::other(internal_rpc_err(err.to_string())),
         }
     }
 }
@@ -814,7 +925,7 @@ pub enum RpcPoolError {
     /// respect the tx fee exceeds the configured cap
     #[error("tx fee ({max_tx_fee_wei} wei) exceeds the configured cap ({tx_fee_cap_wei} wei)")]
     ExceedsFeeCap {
-        /// max fee in wei of new tx submitted to the pull (e.g. 0.11534 ETH)
+        /// max fee in wei of new tx submitted to the pool (e.g. 0.11534 ETH)
         max_tx_fee_wei: u128,
         /// configured tx fee cap in wei (e.g. 1.0 ETH)
         tx_fee_cap_wei: u128,
@@ -823,8 +934,13 @@ pub enum RpcPoolError {
     #[error("negative value")]
     NegativeValue,
     /// When oversized data is encountered
-    #[error("oversized data")]
-    OversizedData,
+    #[error("oversized data: transaction size {size}, limit {limit}")]
+    OversizedData {
+        /// Size of the transaction/input data that exceeded the limit.
+        size: usize,
+        /// Configured limit that was exceeded.
+        limit: usize,
+    },
     /// When the max initcode size is exceeded
     #[error("max initcode size exceeded")]
     ExceedsMaxInitCodeSize,
@@ -866,7 +982,7 @@ impl From<RpcPoolError> for jsonrpsee_types::error::ErrorObject<'static> {
             RpcPoolError::MaxTxGasLimitExceeded |
             RpcPoolError::ExceedsFeeCap { .. } |
             RpcPoolError::NegativeValue |
-            RpcPoolError::OversizedData |
+            RpcPoolError::OversizedData { .. } |
             RpcPoolError::ExceedsMaxInitCodeSize |
             RpcPoolError::PoolTransactionError(_) |
             RpcPoolError::Eip4844(_) |
@@ -910,7 +1026,9 @@ impl From<InvalidPoolTransactionError> for RpcPoolError {
             InvalidPoolTransactionError::IntrinsicGasTooLow => {
                 Self::Invalid(RpcInvalidTransactionError::GasTooLow)
             }
-            InvalidPoolTransactionError::OversizedData(_, _) => Self::OversizedData,
+            InvalidPoolTransactionError::OversizedData { size, limit } => {
+                Self::OversizedData { size, limit }
+            }
             InvalidPoolTransactionError::Underpriced => Self::Underpriced,
             InvalidPoolTransactionError::Eip2681 => {
                 Self::Invalid(RpcInvalidTransactionError::NonceMaxValue)
@@ -1014,6 +1132,47 @@ mod tests {
         let err: jsonrpsee_types::error::ErrorObject<'static> =
             EthApiError::HeaderNotFound(BlockId::finalized()).into();
         assert_eq!(err.message(), "block not found: finalized");
+    }
+
+    #[test]
+    fn receipts_not_found_message() {
+        let err: jsonrpsee_types::error::ErrorObject<'static> =
+            EthApiError::ReceiptsNotFound(BlockId::hash(b256!(
+                "0x1a15e3c30cf094a99826869517b16d185d45831d3a494f01030b0001a9d3ebb9"
+            )))
+            .into();
+        assert_eq!(
+            err.message(),
+            "block not found: hash 0x1a15e3c30cf094a99826869517b16d185d45831d3a494f01030b0001a9d3ebb9"
+        );
+        let err: jsonrpsee_types::error::ErrorObject<'static> =
+            EthApiError::ReceiptsNotFound(BlockId::hash_canonical(b256!(
+                "0x1a15e3c30cf094a99826869517b16d185d45831d3a494f01030b0001a9d3ebb9"
+            )))
+            .into();
+        assert_eq!(
+            err.message(),
+            "block not found: canonical hash 0x1a15e3c30cf094a99826869517b16d185d45831d3a494f01030b0001a9d3ebb9"
+        );
+        let err: jsonrpsee_types::error::ErrorObject<'static> =
+            EthApiError::ReceiptsNotFound(BlockId::number(100000)).into();
+        assert_eq!(err.code(), EthRpcErrorCode::ResourceNotFound.code());
+        assert_eq!(err.message(), "block not found: 0x186a0");
+        let err: jsonrpsee_types::error::ErrorObject<'static> =
+            EthApiError::ReceiptsNotFound(BlockId::latest()).into();
+        assert_eq!(err.message(), "block not found: latest");
+        let err: jsonrpsee_types::error::ErrorObject<'static> =
+            EthApiError::ReceiptsNotFound(BlockId::safe()).into();
+        assert_eq!(err.message(), "block not found: safe");
+        let err: jsonrpsee_types::error::ErrorObject<'static> =
+            EthApiError::ReceiptsNotFound(BlockId::finalized()).into();
+        assert_eq!(err.message(), "block not found: finalized");
+        let err: jsonrpsee_types::error::ErrorObject<'static> =
+            EthApiError::ReceiptsNotFound(BlockId::pending()).into();
+        assert_eq!(err.message(), "block not found: pending");
+        let err: jsonrpsee_types::error::ErrorObject<'static> =
+            EthApiError::ReceiptsNotFound(BlockId::earliest()).into();
+        assert_eq!(err.message(), "block not found: earliest");
     }
 
     #[test]

@@ -50,7 +50,7 @@
 //! #### Naming
 //!
 //! The types in this crate support multiple recovery functions, e.g.
-//! [`SealedBlock::try_recover_unchecked`] and [`SealedBlock::try_recover_unchecked`]. The `_unchecked` suffix indicates that this function recovers the signer _without ensuring that the signature has a low `s` value_, in other words this rule introduced in [EIP-2](https://github.com/ethereum/EIPs/blob/master/EIPS/eip-2.md) is ignored.
+//! [`SealedBlock::try_recover`] and [`SealedBlock::try_recover_unchecked`]. The `_unchecked` suffix indicates that this function recovers the signer _without ensuring that the signature has a low `s` value_, in other words this rule introduced in [EIP-2](https://github.com/ethereum/EIPs/blob/master/EIPS/eip-2.md) is ignored.
 //! Hence this function is necessary when dealing with pre EIP-2 transactions on the ethereum
 //! mainnet. Newer transactions must always be recovered with the regular `recover` functions, see
 //! also [`recover_signer`](crypto::secp256k1::recover_signer).
@@ -111,7 +111,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[macro_use]
@@ -144,9 +144,11 @@ pub mod block;
 pub use block::{
     body::{BlockBody, FullBlockBody},
     header::{AlloyBlockHeader, BlockHeader, FullBlockHeader},
+    recovered::IndexedTx,
     Block, FullBlock, RecoveredBlock, SealedBlock,
 };
 
+#[cfg(test)]
 mod withdrawal;
 pub use alloy_eips::eip2718::WithEncoded;
 
@@ -155,6 +157,7 @@ pub mod crypto;
 mod error;
 pub use error::{GotExpected, GotExpectedBoxed};
 
+#[cfg(test)]
 mod log;
 pub use alloy_primitives::{logs_bloom, Log, LogData};
 
@@ -187,7 +190,7 @@ pub use size::InMemorySize;
 
 /// Node traits
 pub mod node;
-pub use node::{BlockTy, BodyTy, FullNodePrimitives, HeaderTy, NodePrimitives, ReceiptTy, TxTy};
+pub use node::{BlockTy, BodyTy, HeaderTy, NodePrimitives, ReceiptTy, TxTy};
 
 /// Helper trait that requires de-/serialize implementation since `serde` feature is enabled.
 #[cfg(feature = "serde")]

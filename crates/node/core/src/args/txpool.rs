@@ -53,6 +53,10 @@ pub struct TxPoolArgs {
     #[arg(long = "txpool.blob-cache-size", alias = "txpool.blob_cache_size")]
     pub blob_cache_size: Option<u32>,
 
+    /// Disable EIP-4844 blob transaction support
+    #[arg(long = "txpool.disable-blobs-support", alias = "txpool.disable_blobs_support", default_value_t = false, conflicts_with_all = ["blobpool_max_count", "blobpool_max_size", "blob_cache_size", "blob_transaction_price_bump"])]
+    pub disable_blobs_support: bool,
+
     /// Max number of executable transaction slots guaranteed per account
     #[arg(long = "txpool.max-account-slots", alias = "txpool.max_account_slots", default_value_t = TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER)]
     pub max_account_slots: usize,
@@ -132,6 +136,28 @@ pub struct TxPoolArgs {
         conflicts_with = "transactions_backup_path"
     )]
     pub disable_transactions_backup: bool,
+
+    /// Max batch size for transaction pool insertions
+    #[arg(long = "txpool.max-batch-size", default_value_t = 1)]
+    pub max_batch_size: usize,
+}
+
+impl TxPoolArgs {
+    /// Sets the minimal protocol base fee to 0, effectively disabling checks that enforce that a
+    /// transaction's fee must be higher than the [`MIN_PROTOCOL_BASE_FEE`] which is the lowest
+    /// value the ethereum EIP-1559 base fee can reach.
+    pub const fn with_disabled_protocol_base_fee(self) -> Self {
+        self.with_protocol_base_fee(0)
+    }
+
+    /// Configures the minimal protocol base fee that should be enforced.
+    ///
+    /// Ethereum's EIP-1559 base fee can't drop below [`MIN_PROTOCOL_BASE_FEE`] hence this is
+    /// enforced by default in the pool.
+    pub const fn with_protocol_base_fee(mut self, protocol_base_fee: u64) -> Self {
+        self.minimal_protocol_basefee = protocol_base_fee;
+        self
+    }
 }
 
 impl Default for TxPoolArgs {
@@ -146,6 +172,7 @@ impl Default for TxPoolArgs {
             blobpool_max_count: TXPOOL_SUBPOOL_MAX_TXS_DEFAULT,
             blobpool_max_size: TXPOOL_SUBPOOL_MAX_SIZE_MB_DEFAULT,
             blob_cache_size: None,
+            disable_blobs_support: false,
             max_account_slots: TXPOOL_MAX_ACCOUNT_SLOTS_PER_SENDER,
             price_bump: DEFAULT_PRICE_BUMP,
             minimal_protocol_basefee: MIN_PROTOCOL_BASE_FEE,
@@ -165,6 +192,7 @@ impl Default for TxPoolArgs {
             max_queued_lifetime: MAX_QUEUED_TRANSACTION_LIFETIME,
             transactions_backup_path: None,
             disable_transactions_backup: false,
+            max_batch_size: 1,
         }
     }
 }
@@ -207,7 +235,13 @@ impl RethTransactionPoolConfig for TxPoolArgs {
             new_tx_listener_buffer_size: self.new_tx_listener_buffer_size,
             max_new_pending_txs_notifications: self.max_new_pending_txs_notifications,
             max_queued_lifetime: self.max_queued_lifetime,
+            ..Default::default()
         }
+    }
+
+    /// Returns max batch size for transaction batch insertion.
+    fn max_batch_size(&self) -> usize {
+        self.max_batch_size
     }
 }
 

@@ -6,7 +6,7 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 /// Re-exported ethereum types
@@ -113,6 +113,15 @@ pub mod node {
     pub use reth_node_core as core;
     #[cfg(feature = "node")]
     pub use reth_node_ethereum::*;
+}
+
+/// Re-exported ethereum engine types
+#[cfg(feature = "node")]
+pub mod engine {
+    #[doc(inline)]
+    pub use reth_engine_local as local;
+    #[doc(inline)]
+    pub use reth_node_ethereum::engine::*;
 }
 
 /// Re-exported reth trie types
