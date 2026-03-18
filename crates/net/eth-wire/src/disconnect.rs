@@ -21,6 +21,15 @@ pub trait CanDisconnect<T>: Sink<T> + Unpin {
         &mut self,
         reason: DisconnectReason,
     ) -> Pin<Box<dyn Future<Output = DisconnectResult<Self::Error>> + Send + '_>>;
+
+    /// Queues a disconnect message for sending without requiring an async context.
+    ///
+    /// This is useful in synchronous trait methods (e.g. `Sink::start_send`) where awaiting a
+    /// future is not possible. The default implementation is a no-op; transports that support
+    /// synchronous disconnect queueing (like `P2PStream`) should override this.
+    fn start_disconnect(&mut self, _reason: DisconnectReason) -> DisconnectResult<Self::Error> {
+        Ok(())
+    }
 }
 
 // basic impls for things like Framed<TcpStream, etc>

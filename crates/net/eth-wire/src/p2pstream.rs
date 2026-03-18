@@ -202,6 +202,10 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), P2PStreamError>> + Send + '_>> {
         Box::pin(async move { self.disconnect(reason).await })
     }
+
+    fn start_disconnect(&mut self, reason: DisconnectReason) -> Result<(), P2PStreamError> {
+        DisconnectP2P::start_disconnect(self, reason)
+    }
 }
 
 /// A `P2PStream` wraps over any `Stream` that yields bytes and makes it compatible with `p2p`

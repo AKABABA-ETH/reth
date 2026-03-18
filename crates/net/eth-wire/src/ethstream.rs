@@ -277,13 +277,9 @@ where
 
     fn start_send(self: Pin<&mut Self>, item: EthMessage<N>) -> Result<(), Self::Error> {
         if matches!(item, EthMessage::Status(_)) {
-            // Attempt to disconnect the peer for protocol breach when trying to send Status
-            // message after handshake is complete
-            let mut this = self.project();
-            // We can't await the disconnect future here since this is a synchronous method,
-            // but we can start the disconnect process. The actual disconnect will be handled
-            // asynchronously by the caller or the stream's poll methods.
-            let _disconnect_future = this.inner.disconnect(DisconnectReason::ProtocolBreach);
+            // Queue a disconnect for protocol breach - sending Status after handshake is invalid
+            let this = self.project();
+            let _ = this.inner.get_mut().start_disconnect(DisconnectReason::ProtocolBreach);
             return Err(EthStreamError::EthHandshakeError(EthHandshakeError::StatusNotInHandshake))
         }
 
