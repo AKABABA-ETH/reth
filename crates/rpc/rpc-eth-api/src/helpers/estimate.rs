@@ -67,6 +67,9 @@ pub trait EstimateCall: Call {
         // consistent with `prepare_call_env` for `eth_call`.
         evm_env.cfg_env.disable_fee_charge = true;
 
+        // Apply the configured EVM memory limit per RPC request.
+        evm_env.cfg_env.memory_limit = self.evm_memory_limit();
+
         // set nonce to None so that the correct nonce is chosen by the EVM
         request.as_mut().take_nonce();
 

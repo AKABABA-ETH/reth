@@ -138,6 +138,9 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
                     // Always disable EIP-3607
                     evm_env.cfg_env.disable_eip3607 = true;
 
+                    // Apply the configured EVM memory limit per RPC request.
+                    evm_env.cfg_env.memory_limit = this.evm_memory_limit();
+
                     if !validation {
                         // If not explicitly required, we disable nonce check <https://github.com/paradigmxyz/reth/issues/16108>
                         evm_env.cfg_env.disable_nonce_check = true;
@@ -500,6 +503,9 @@ pub trait EthCall: EstimateCall + Call + LoadPendingBlock + LoadBlock + FullEthA
             // Disable additional fee charges (e.g. L2 operator fees),
             // consistent with prepare_call_env and estimate_gas_with.
             evm_env.cfg_env.disable_fee_charge = true;
+
+            // Apply the configured EVM memory limit per RPC request.
+            evm_env.cfg_env.memory_limit = this.evm_memory_limit();
 
             // Disable EIP-7825 transaction gas limit cap so that the gas limit
             // fallback (block gas limit) is not rejected when it exceeds the
