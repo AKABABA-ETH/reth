@@ -46,6 +46,52 @@ pub trait EngineApiValidWaitExt<N>: Send + Sync {
     ) -> TransportResult<ForkchoiceUpdated>;
 }
 
+/// Shared retry loop for all `fork_choice_updated_*_wait` methods.
+///
+/// Polls the given `call` future until the response is VALID, panics on INVALID,
+/// and returns an error on SYNCING (indicating a missing canonical parent).
+async fn poll_forkchoice_updated<F, Fut>(
+    method: &str,
+    fork_choice_state: ForkchoiceState,
+    payload_attributes: Option<PayloadAttributes>,
+    call: F,
+) -> TransportResult<ForkchoiceUpdated>
+where
+    F: Fn(ForkchoiceState, Option<PayloadAttributes>) -> Fut,
+    Fut: std::future::Future<Output = TransportResult<ForkchoiceUpdated>>,
+{
+    debug!(
+        target: "reth-bench",
+        method,
+        ?fork_choice_state,
+        ?payload_attributes,
+        "Sending forkchoiceUpdated"
+    );
+
+    let mut status = call(fork_choice_state, payload_attributes.clone()).await?;
+
+    while !status.is_valid() {
+        if status.is_invalid() {
+            error!(
+                target: "reth-bench",
+                ?status,
+                ?fork_choice_state,
+                ?payload_attributes,
+                "Invalid {method} message",
+            );
+            panic!("Invalid {method}: {status:?}");
+        }
+        if status.is_syncing() {
+            return Err(alloy_json_rpc::RpcError::UnsupportedFeature(
+                "invalid range: no canonical state found for parent of requested block",
+            ))
+        }
+        status = call(fork_choice_state, payload_attributes.clone()).await?;
+    }
+
+    Ok(status)
+}
+
 #[async_trait::async_trait]
 impl<N, P> EngineApiValidWaitExt<N> for P
 where
@@ -57,38 +103,13 @@ where
         fork_choice_state: ForkchoiceState,
         payload_attributes: Option<PayloadAttributes>,
     ) -> TransportResult<ForkchoiceUpdated> {
-        debug!(
-            target: "reth-bench",
-            method = "engine_forkchoiceUpdatedV1",
-            ?fork_choice_state,
-            ?payload_attributes,
-            "Sending forkchoiceUpdated"
-        );
-
-        let mut status =
-            self.fork_choice_updated_v1(fork_choice_state, payload_attributes.clone()).await?;
-
-        while !status.is_valid() {
-            if status.is_invalid() {
-                error!(
-                    target: "reth-bench",
-                    ?status,
-                    ?fork_choice_state,
-                    ?payload_attributes,
-                    "Invalid forkchoiceUpdatedV1 message",
-                );
-                panic!("Invalid forkchoiceUpdatedV1: {status:?}");
-            }
-            if status.is_syncing() {
-                return Err(alloy_json_rpc::RpcError::UnsupportedFeature(
-                    "invalid range: no canonical state found for parent of requested block",
-                ))
-            }
-            status =
-                self.fork_choice_updated_v1(fork_choice_state, payload_attributes.clone()).await?;
-        }
-
-        Ok(status)
+        poll_forkchoice_updated(
+            "engine_forkchoiceUpdatedV1",
+            fork_choice_state,
+            payload_attributes,
+            |fcs, pa| self.fork_choice_updated_v1(fcs, pa),
+        )
+        .await
     }
 
     async fn fork_choice_updated_v2_wait(
@@ -96,38 +117,13 @@ where
         fork_choice_state: ForkchoiceState,
         payload_attributes: Option<PayloadAttributes>,
     ) -> TransportResult<ForkchoiceUpdated> {
-        debug!(
-            target: "reth-bench",
-            method = "engine_forkchoiceUpdatedV2",
-            ?fork_choice_state,
-            ?payload_attributes,
-            "Sending forkchoiceUpdated"
-        );
-
-        let mut status =
-            self.fork_choice_updated_v2(fork_choice_state, payload_attributes.clone()).await?;
-
-        while !status.is_valid() {
-            if status.is_invalid() {
-                error!(
-                    target: "reth-bench",
-                    ?status,
-                    ?fork_choice_state,
-                    ?payload_attributes,
-                    "Invalid forkchoiceUpdatedV2 message",
-                );
-                panic!("Invalid forkchoiceUpdatedV2: {status:?}");
-            }
-            if status.is_syncing() {
-                return Err(alloy_json_rpc::RpcError::UnsupportedFeature(
-                    "invalid range: no canonical state found for parent of requested block",
-                ))
-            }
-            status =
-                self.fork_choice_updated_v2(fork_choice_state, payload_attributes.clone()).await?;
-        }
-
-        Ok(status)
+        poll_forkchoice_updated(
+            "engine_forkchoiceUpdatedV2",
+            fork_choice_state,
+            payload_attributes,
+            |fcs, pa| self.fork_choice_updated_v2(fcs, pa),
+        )
+        .await
     }
 
     async fn fork_choice_updated_v3_wait(
@@ -135,33 +131,13 @@ where
         fork_choice_state: ForkchoiceState,
         payload_attributes: Option<PayloadAttributes>,
     ) -> TransportResult<ForkchoiceUpdated> {
-        debug!(
-            target: "reth-bench",
-            method = "engine_forkchoiceUpdatedV3",
-            ?fork_choice_state,
-            ?payload_attributes,
-            "Sending forkchoiceUpdated"
-        );
-
-        let mut status =
-            self.fork_choice_updated_v3(fork_choice_state, payload_attributes.clone()).await?;
-
-        while !status.is_valid() {
-            if status.is_invalid() {
-                error!(
-                    target: "reth-bench",
-                    ?status,
-                    ?fork_choice_state,
-                    ?payload_attributes,
-                    "Invalid forkchoiceUpdatedV3 message",
-                );
-                panic!("Invalid forkchoiceUpdatedV3: {status:?}");
-            }
-            status =
-                self.fork_choice_updated_v3(fork_choice_state, payload_attributes.clone()).await?;
-        }
-
-        Ok(status)
+        poll_forkchoice_updated(
+            "engine_forkchoiceUpdatedV3",
+            fork_choice_state,
+            payload_attributes,
+            |fcs, pa| self.fork_choice_updated_v3(fcs, pa),
+        )
+        .await
     }
 }
 
