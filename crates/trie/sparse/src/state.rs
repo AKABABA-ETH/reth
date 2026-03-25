@@ -9,7 +9,7 @@ use crate::{
 use alloc::vec::Vec;
 use alloy_primitives::{map::B256Map, B256};
 use alloy_rlp::{Decodable, Encodable};
-use reth_execution_errors::{SparseStateTrieResult, SparseTrieErrorKind};
+use reth_execution_errors::{SparseStateTrieError, SparseStateTrieResult, SparseTrieErrorKind};
 use reth_primitives_traits::Account;
 use reth_trie_common::{
     updates::{StorageTrieUpdates, TrieUpdates},
@@ -355,23 +355,33 @@ where
                 })
                 .collect();
 
-            let mut any_err = Ok(());
+            let mut first_err: Option<SparseStateTrieError> = None;
             for (account, result, trie, bufs) in results {
-                self.storage.tries.insert(account, trie);
-                if let Ok(_total_nodes) = result {
-                    #[cfg(feature = "metrics")]
-                    {
-                        self.metrics.increment_total_storage_nodes(_total_nodes as u64);
+                match result {
+                    Ok(_total_nodes) => {
+                        // Only insert trie on success to avoid inconsistent state
+                        self.storage.tries.insert(account, trie);
+                        #[cfg(feature = "metrics")]
+                        {
+                            self.metrics.increment_total_storage_nodes(_total_nodes as u64);
+                        }
                     }
-                } else {
-                    any_err = result.map(|_| ());
+                    Err(err) => {
+                        // Capture first error, don't insert failed tries
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                    }
                 }
 
                 // Keep buffers for deferred dropping
                 self.deferred_drops.proof_nodes_bufs.extend(bufs);
             }
 
-            any_err
+            match first_err {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
         }
     }
 
