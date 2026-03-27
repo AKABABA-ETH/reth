@@ -32,7 +32,7 @@ impl LogFormat {
     /// * `color` - An optional string that enables or disables ANSI color codes in the logs.
     /// * `show_target` - Whether to show the target module path in log output.
     /// * `file_writer` - An optional [`NonBlocking`] writer for directing logs to a file. When
-    ///   `None`, logs are written to stdout.
+    ///   `None`, logs are written to stderr.
     ///
     /// # Returns
     /// A `BoxedLayer<Registry>` that can be added to a tracing subscriber.
@@ -61,7 +61,7 @@ impl LogFormat {
                 if let Some(writer) = file_writer {
                     layer.with_writer(writer).with_filter(filter).boxed()
                 } else {
-                    layer.with_filter(filter).boxed()
+                    layer.with_writer(std::io::stderr).with_filter(filter).boxed()
                 }
             }
             Self::LogFmt => {
@@ -69,7 +69,7 @@ impl LogFormat {
                 if let Some(writer) = file_writer {
                     layer.with_writer(writer).with_filter(filter).boxed()
                 } else {
-                    layer.with_filter(filter).boxed()
+                    layer.with_writer(std::io::stderr).with_filter(filter).boxed()
                 }
             }
             Self::Terminal => {
@@ -77,7 +77,7 @@ impl LogFormat {
                 if let Some(writer) = file_writer {
                     layer.with_writer(writer).with_filter(filter).boxed()
                 } else {
-                    layer.with_filter(filter).boxed()
+                    layer.with_writer(std::io::stderr).with_filter(filter).boxed()
                 }
             }
         }
